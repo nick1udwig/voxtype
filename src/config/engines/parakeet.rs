@@ -33,11 +33,11 @@ pub struct ParakeetConfig {
     #[serde(default = "default_on_demand_loading")]
     pub on_demand_loading: bool,
 
-    /// Use the cache-aware streaming pipeline (parakeet-rs `ParakeetUnified`)
+    /// Use the buffered streaming pipeline (parakeet-rs `ParakeetUnified`)
     /// instead of the batch CTC/TDT models. When true, voxtype emits live
     /// partial transcripts during recording and types the final transcript
     /// on hotkey release. Requires a streaming-capable model directory
-    /// (TDT v3 family with `tokenizer.model`).
+    /// (Parakeet Unified with `tokenizer.model`).
     /// Default: false (batch pipeline, identical to pre-streaming behavior).
     #[serde(default)]
     pub streaming: bool,
@@ -59,15 +59,17 @@ pub struct ParakeetConfig {
 }
 
 fn default_streaming_chunk_secs() -> f32 {
-    0.5
+    // Match parakeet-rs / NVIDIA's default profile. Durations must align to
+    // eight 10 ms mel frames (80 ms); the old 0.5/1.5/0.5 profile was invalid.
+    0.56
 }
 
 fn default_streaming_left_context_secs() -> f32 {
-    1.5
+    5.6
 }
 
 fn default_streaming_right_context_secs() -> f32 {
-    0.5
+    0.56
 }
 
 impl Default for ParakeetConfig {

@@ -2665,6 +2665,7 @@ impl Daemon {
         // streaming is enabled. The user's config file is left untouched; this
         // override only applies to the running daemon.
         if self.config.streaming_active()
+            && self.config.engine != crate::config::TranscriptionEngine::Parakeet
             && self.config.hotkey.mode == crate::config::ActivationMode::PushToTalk
         {
             tracing::warn!(
@@ -3873,6 +3874,12 @@ impl Daemon {
                 }, if state.is_streaming() && streaming_handle.is_some() => {
                     match event {
                         Some(StreamingEvent::Partial { text, .. }) => {
+                            if self.config.engine == crate::config::TranscriptionEngine::Parakeet {
+                                // Unified emits cumulative previews. Desktop insertion, like
+                                // phone insertion, commits only the completed transcript.
+                                if let Some(s) = streaming_session.as_mut() { s.observe_partial(text); }
+                                continue;
+                            }
                             if let (Some(s), Some(chain)) =
                                 (streaming_session.as_mut(), streaming_chain.as_ref())
                             {
@@ -3890,6 +3897,13 @@ impl Daemon {
                             }
                         }
                         Some(StreamingEvent::Final { text, .. }) => {
+                            let text = if self.config.engine == crate::config::TranscriptionEngine::Parakeet {
+                                if let Some(s) = streaming_session.as_mut() { s.clear_partial(); }
+                                let text = self.text_processor.process(&text);
+                                if let Some(processor) = &self.post_processor {
+                                    processor.process(&text).await
+                                } else { text }
+                            } else { text };
                             if let (Some(s), Some(chain)) =
                                 (streaming_session.as_mut(), streaming_chain.as_ref())
                             {
