@@ -134,6 +134,7 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                 let deadline = tokio::time::sleep(Duration::from_secs(480));
                 tokio::pin!(deadline);
                 let mut finished = false;
+                let mut pending = None;
                 loop {
                     tokio::select! {
                         _ = &mut deadline => break,
@@ -143,15 +144,20 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                             if !matches!(tokio::time::timeout(Duration::from_secs(5), ws.send(Message::Text(event.to_string()))).await, Ok(Ok(()))) { break }
                             if terminal { let _ = ws.close(None).await; break }
                         }
-                        message = ws.next() => match message {
+                        permit = audio.reserve(), if pending.is_some() => {
+                            let Ok(permit) = permit else { break };
+                            permit.send(pending.take().unwrap());
+                        }
+                        message = ws.next(), if pending.is_none() => match message {
                             Some(Ok(Message::Binary(bytes))) if !finished => {
                                 let Ok(samples) = decode_pcm(&bytes) else { break };
-                                // Bounded queue: overload cancels rather than losing audio.
-                                if audio.try_send(Input::Audio(samples)).is_err() { break }
+                                // Backpressure the socket while continuing to drain result events.
+                                // One pending frame plus the bounded channel; no audio is dropped.
+                                pending = Some(Input::Audio(samples));
                             }
                             Some(Ok(Message::Text(text))) if !finished => {
                                 match serde_json::from_str::<Value>(&text).ok().and_then(|v| v["type"].as_str().map(str::to_owned)).as_deref() {
-                                    Some("finish") => { finished = true; if audio.send(Input::Finish).await.is_err() { break } },
+                                    Some("finish") => { finished = true; pending = Some(Input::Finish); },
                                     _ => break, // includes explicit cancel
                                 }
                             }
@@ -231,22 +237,31 @@ async fn recognize_streaming(
         task,
     } = handle;
     let mut audio = Some(audio_tx);
+    let mut pending = None;
     let mut count = 0;
     let mut final_text = None;
-    let deadline = tokio::time::sleep(Duration::from_secs(max_secs as u64 + 10));
+    // Allow catch-up after a slow decoder or a burst of buffered phone audio.
+    let deadline = tokio::time::sleep(Duration::from_secs(max_secs as u64 + 180));
     tokio::pin!(deadline);
     let outcome = loop {
         tokio::select! {
             biased;
             _ = events.closed() => break Ok(None),
             _ = &mut deadline => break Err("recording_timeout".to_string()),
-            chunk = input.recv() => match chunk {
+            permit = async { audio.as_ref().unwrap().clone().reserve_owned().await }, if pending.is_some() => {
+                match permit {
+                    Ok(permit) => { permit.send(pending.take().unwrap()); },
+                    Err(_) => break Err("stream_ended_early".into()),
+                }
+            },
+            chunk = input.recv(), if pending.is_none() => match chunk {
                 Some(Input::Audio(chunk)) => {
                     count += chunk.len();
                     if count > max_secs as usize * 16000 { break Err("audio_limit".into()); }
-                    let Some(sender) = audio.as_ref() else { break Err("audio_after_finish".into()); };
-                    // Never drop audio or grow an unbounded inference backlog.
-                    if sender.try_send(chunk).is_err() { break Err("stream_overloaded".into()); }
+                    if audio.is_none() { break Err("audio_after_finish".into()); }
+                    // Waiting for capacity must not block consuming backend events:
+                    // some backends wait for an event consumer before reading more audio.
+                    pending = Some(chunk);
                 }
                 Some(Input::Finish) => { audio.take(); }
                 None => break Ok(None),
@@ -357,6 +372,8 @@ mod tests {
         starts: Arc<AtomicUsize>,
         cancelled: Arc<AtomicUsize>,
         fail_flush: bool,
+        samples: Arc<AtomicUsize>,
+        delay: Duration,
     }
     impl StreamFake {
         fn new(fail_flush: bool) -> Self {
@@ -365,6 +382,8 @@ mod tests {
                 starts: Arc::new(AtomicUsize::new(0)),
                 cancelled: Arc::new(AtomicUsize::new(0)),
                 fail_flush,
+                samples: Arc::new(AtomicUsize::new(0)),
+                delay: Duration::ZERO,
             }
         }
     }
@@ -386,6 +405,8 @@ mod tests {
             let active = self.active.clone();
             let cancelled = self.cancelled.clone();
             let fail_flush = self.fail_flush;
+            let received = self.samples.clone();
+            let delay = self.delay;
             let (tx, events) = mpsc::channel(16);
             let (cancel, mut cancel_rx) = oneshot::channel();
             let task = tokio::spawn(async move {
@@ -402,6 +423,8 @@ mod tests {
                                 let _ = tx.send(StreamingEvent::Ended).await;
                                 break;
                             }
+                            received.fetch_add(chunk.unwrap().len(), Ordering::SeqCst);
+                            tokio::time::sleep(delay).await;
                             let _ = tx.send(StreamingEvent::Partial {text:"hello".into(), segment_id:0}).await;
                         }
                     }
@@ -470,6 +493,112 @@ mod tests {
         assert_eq!(session.task.await.unwrap().unwrap_err(), "audio_limit");
         assert_eq!(model.active.load(Ordering::SeqCst), 0);
     }
+    #[tokio::test]
+    async fn streaming_burst_backpressures_without_losing_audio_or_deadlocking_events() {
+        let mut model = StreamFake::new(false);
+        model.delay = Duration::from_millis(2);
+        let model = Arc::new(model);
+        let (session, a) = start(model.clone(), None, 60);
+        let producer = tokio::spawn(async move {
+            for _ in 0..300 {
+                a.audio.send(Input::Audio(vec![0.1; 1600])).await.unwrap();
+            }
+            a.audio.send(Input::Finish).await.unwrap();
+            a
+        });
+        let result = tokio::time::timeout(Duration::from_secs(5), session.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let _admission = producer.await.unwrap();
+        assert_eq!(result.as_deref(), Some("hello world"));
+        assert_eq!(model.samples.load(Ordering::SeqCst), 300 * 1600);
+        assert_eq!(model.active.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_while_backpressured_still_joins_worker() {
+        let mut model = StreamFake::new(false);
+        model.delay = Duration::from_millis(20);
+        let model = Arc::new(model);
+        let (session, a) = start(model.clone(), None, 60);
+        let producer = tokio::spawn(async move {
+            for _ in 0..300 {
+                if a.audio.send(Input::Audio(vec![0.1; 1600])).await.is_err() {
+                    break;
+                }
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        drop(a.events);
+        assert!(tokio::time::timeout(Duration::from_secs(2), session.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .is_none());
+        producer.await.unwrap();
+        assert_eq!(model.active.load(Ordering::SeqCst), 0);
+        assert_eq!(model.cancelled.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn websocket_burst_larger_than_both_audio_queues_completes() {
+        use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1/dictate", listener.local_addr().unwrap());
+        let mut requests = serve(listener, "burst-test".into());
+        let mut request = url.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", "Bearer burst-test".parse().unwrap());
+        let (mut ws, _) = connect_async(request).await.unwrap();
+        let mut model = StreamFake::new(false);
+        model.delay = Duration::from_millis(2);
+        let model = Arc::new(model);
+        let (session, admission) = start(model.clone(), None, 60);
+        assert!(requests
+            .recv()
+            .await
+            .unwrap()
+            .reply
+            .send(Ok(admission))
+            .is_ok());
+        ws.next().await.unwrap().unwrap();
+        for _ in 0..300 {
+            ws.send(Message::Binary(vec![0; 3200])).await.unwrap();
+        }
+        ws.send(Message::Text(r#"{"type":"finish"}"#.into()))
+            .await
+            .unwrap();
+        let text = tokio::time::timeout(Duration::from_secs(5), session.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        session
+            .events
+            .send(json!({"type":"final","text":text}))
+            .await
+            .unwrap();
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(2), ws.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let event: Value = serde_json::from_str(&message.into_text().unwrap()).unwrap();
+            if event["type"] == "final" {
+                assert_eq!(event["text"], "hello world");
+                break;
+            }
+        }
+        assert_eq!(model.samples.load(Ordering::SeqCst), 300 * 1600);
+        assert_eq!(model.active.load(Ordering::SeqCst), 0);
+    }
+
     struct Fake {
         calls: AtomicUsize,
         active: AtomicUsize,
