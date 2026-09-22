@@ -74,6 +74,7 @@ pub mod config;
 pub mod config_set;
 pub mod cpu;
 pub mod daemon;
+pub mod remote;
 pub mod daemon_status;
 pub mod eager;
 pub mod error;

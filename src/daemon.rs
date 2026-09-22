@@ -838,7 +838,7 @@ pub struct Daemon {
         tokio::task::JoinHandle<std::result::Result<String, crate::error::TranscribeError>>,
     )>,
     // Voice Activity Detection (filters silence-only recordings)
-    vad: Option<Box<dyn crate::vad::VoiceActivityDetector>>,
+    vad: Option<Arc<dyn crate::vad::VoiceActivityDetector>>,
     // Meeting mode daemon (optional, created when meeting starts)
     meeting_daemon: Option<MeetingDaemon>,
     // Meeting state file path
@@ -923,7 +923,7 @@ impl Daemon {
                     config.vad.threshold,
                     config.vad.min_speech_duration_ms
                 );
-                Some(vad)
+                Some(Arc::from(vad))
             }
             Ok(None) => None,
             Err(e) => {
@@ -2955,6 +2955,20 @@ impl Daemon {
         // Cached transcriber for eager chunk processing during recording
         let mut eager_transcriber: Option<Arc<dyn Transcriber>> = None;
 
+        // Mobile admission lives in this event loop, sharing its model owner.
+        let mut remote_rx = crate::remote::listen().await?;
+        if remote_rx.is_some() && (self.config.on_demand_loading()
+            || self.config.whisper.gpu_isolation
+            || self.config.whisper.eager_processing
+            || self.config.whisper.secondary_model.is_some()
+            || self.config.meeting.enabled
+            || (self.config.engine != crate::config::TranscriptionEngine::Parakeet
+                && transcriber_preloaded.as_ref().is_some_and(|t| t.as_streaming().is_some()))) {
+            return Err(crate::error::VoxtypeError::Config(
+                "Mobile API requires a preloaded batch or Parakeet Unified streaming model, no GPU isolation, secondary model, eager processing or meeting mode".into()));
+        }
+        let mut remote: Option<crate::remote::Session> = None;
+
         // Streaming session locals (Some only while State::Streaming).
         let mut streaming_handle: Option<StreamHandle> = None;
         let mut streaming_session: Option<StreamingSession> = None;
@@ -2962,6 +2976,56 @@ impl Daemon {
 
         loop {
             tokio::select! {
+                Some(request) = async {
+                    match &mut remote_rx {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if request.reply.is_closed() { continue; }
+                    if remote.is_some() || !state.is_idle() || self.transcription_task.is_some() || self.meeting_active() {
+                        let _ = request.reply.send(Err("busy"));
+                        continue;
+                    }
+                    match self.get_transcriber_for_recording(None, &transcriber_preloaded).await {
+                        Ok(model) => {
+                            let (session, admission) = crate::remote::start(model, self.vad.clone(),
+                                self.config.audio.max_duration_secs.clamp(1, 300));
+                            remote = Some(session);
+                            let _ = request.reply.send(Ok(admission));
+                        }
+                        Err(()) => { let _ = request.reply.send(Err("model_unavailable")); }
+                    }
+                }
+                result = async {
+                    match remote.as_mut() {
+                        Some(session) => (&mut session.task).await,
+                        None => std::future::pending().await,
+                    }
+                }, if remote.is_some() => {
+                    let session = remote.take().unwrap();
+                    let event = match result {
+                        Ok(Ok(Some(text))) => {
+                            let text = self.text_processor.process(&text);
+                            let (text, _) = self.text_processor.detect_submit(&text, None);
+                            // Use the configured processor, with no desktop dictation context.
+                            let text = if text.is_empty() { text } else if let Some(processor) = &self.post_processor {
+                                processor.process(&text).await
+                            } else { text };
+                            serde_json::json!({"type":"final","text":text})
+                        }
+                        Ok(Ok(None)) => serde_json::json!({"type":"error","code":"cancelled"}),
+                        Ok(Err(error)) => {
+                            tracing::warn!(%error, "Mobile transcription failed");
+                            serde_json::json!({"type":"error","code":"transcription_failed"})
+                        }
+                        Err(error) => {
+                            tracing::error!(%error, "Mobile transcription task failed");
+                            serde_json::json!({"type":"error","code":"transcription_failed"})
+                        }
+                    };
+                    let _ = tokio::time::timeout(Duration::from_secs(2), session.events.send(event)).await;
+                }
                 // Handle hotkey events (only if hotkey listener is enabled)
                 Some(hotkey_event) = async {
                     match &mut hotkey_rx {
@@ -2969,6 +3033,7 @@ impl Daemon {
                         None => std::future::pending().await,
                     }
                 } => {
+                    if remote.is_some() { continue; }
                     match (hotkey_event, activation_mode) {
                         // === PUSH-TO-TALK MODE ===
                         (HotkeyEvent::Pressed { model_override, profile_override }, ActivationMode::PushToTalk) => {
@@ -3431,7 +3496,7 @@ impl Daemon {
 
                                 // Abort the transcription task
                                 if let Some(task) = self.transcription_task.take() {
-                                    task.abort();
+                                    let _ = task.await;
                                 }
                                 // Drop the cloned transcriber Arc so it isn't
                                 // held until the next transcription.
@@ -3659,6 +3724,7 @@ impl Daemon {
 
                 // Handle SIGUSR1 - start recording (for compositor keybindings)
                 _ = sigusr1.recv() => {
+                    if remote.is_some() { continue; }
                     tracing::debug!("Received SIGUSR1 (start recording)");
                     if state.is_idle() {
                         // Read model override from file (set by `voxtype record start --model X`)
@@ -3784,6 +3850,7 @@ impl Daemon {
 
                 // Handle SIGUSR2 - stop recording (for compositor keybindings)
                 _ = sigusr2.recv() => {
+                    if remote.is_some() { continue; }
                     tracing::debug!("Received SIGUSR2 (stop recording)");
                     if state.is_streaming() {
                         tracing::info!("SIGUSR2 stop while streaming; closing capture and disowning session");
@@ -3981,7 +4048,7 @@ impl Daemon {
 
                         // Abort the transcription task
                         if let Some(task) = self.transcription_task.take() {
-                            task.abort();
+                            let _ = task.await;
                         }
                         // Drop the cloned transcriber Arc so it isn't held
                         // until the next transcription.
@@ -4033,7 +4100,7 @@ impl Daemon {
                         std::sync::atomic::AtomicU32::new(0);
                     let count =
                         EVICTION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if count.is_multiple_of(600) && matches!(state, State::Idle) {
+                    if count.is_multiple_of(600) && remote.is_none() && matches!(state, State::Idle) {
                         if let Some(ref mut mm) = self.model_manager {
                             mm.evict_idle_models();
                         }
@@ -4041,7 +4108,7 @@ impl Daemon {
 
                     // Check for meeting start command
                     if let Some(trigger) = check_meeting_start() {
-                        if self.config.meeting.enabled && self.meeting_daemon.is_none() {
+                        if remote.is_none() && self.config.meeting.enabled && self.meeting_daemon.is_none() {
                             tracing::debug!("Meeting start requested via file trigger");
                             if let Err(e) = self.start_meeting(trigger.title, trigger.diarization).await {
                                 tracing::error!("Failed to start meeting: {}", e);
