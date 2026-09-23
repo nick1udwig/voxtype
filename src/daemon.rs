@@ -1192,7 +1192,13 @@ impl Daemon {
             finalized_text: String::new(),
             typed_chars: 0,
         };
-        self.update_state("streaming");
+        self.update_state(
+            if self.config.engine == crate::config::TranscriptionEngine::Parakeet {
+                "recording"
+            } else {
+                "streaming"
+            },
+        );
         self.play_feedback(SoundEvent::RecordingStart);
 
         if let Some(cmd) = &self.config.output.pre_recording_command {
@@ -1254,15 +1260,63 @@ impl Daemon {
 
     /// Early-stop the streaming capture: cut audio flow to the backend,
     /// start the OSD silence pump so the visualizer stays alive during
-    /// drain, and stop the mic. Leaves `streaming_session`/`_chain` for
-    /// the caller to disown (or keep, to receive trailing finals).
-    async fn stop_streaming_capture(&mut self, audio_capture: &mut Option<Box<dyn AudioCapture>>) {
+    /// drain, and stop the mic. Unified must keep its output destination until
+    /// the final transcript arrives; incremental backends retain their existing
+    /// stop policy for already-typed text.
+    async fn stop_streaming_capture(
+        &mut self,
+        audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        streaming_session: &mut Option<StreamingSession>,
+        streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
+        discard_incremental_tail: bool,
+    ) {
         self.cut_streaming_audio();
         self.start_streaming_drain_pump();
         if let Some(mut c) = audio_capture.take() {
             let _ = c.stop().await;
         }
         self.restore_recording_media();
+        if self.config.engine == crate::config::TranscriptionEngine::Parakeet {
+            self.update_state("transcribing");
+        } else if discard_incremental_tail {
+            *streaming_session = None;
+            *streaming_chain = None;
+        }
+    }
+
+    /// Unified emits one completed transcript. Join its existing worker, then
+    /// use the normal desktop output path (CLI overrides, modifier release,
+    /// profiles, text processing, file results and hooks included).
+    #[allow(clippy::too_many_arguments)]
+    async fn complete_unified_desktop(
+        &mut self,
+        state: &mut State,
+        audio_capture: &mut Option<Box<dyn AudioCapture>>,
+        streaming_handle: &mut Option<StreamHandle>,
+        streaming_session: &mut Option<StreamingSession>,
+        streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
+        result: TranscriptionResult,
+    ) {
+        self.cut_streaming_audio();
+        if let Some(mut capture) = audio_capture.take() {
+            let _ = capture.stop().await;
+        }
+        self.restore_recording_media();
+        let result = if let Some(handle) = streaming_handle.take() {
+            match handle.task.await {
+                Ok(Ok(())) => Ok(result),
+                Ok(Err(error)) => Ok(Err(error)),
+                Err(error) => Err(error),
+            }
+        } else {
+            Ok(result)
+        };
+        self.stop_streaming_drain_pump();
+        *streaming_session = None;
+        *streaming_chain = None;
+        *state = State::Transcribing { audio: Vec::new() };
+        self.update_state("transcribing");
+        self.handle_transcription_result(state, result).await;
     }
 
     async fn end_streaming(
@@ -2957,13 +3011,17 @@ impl Daemon {
 
         // Mobile admission lives in this event loop, sharing its model owner.
         let mut remote_rx = crate::remote::listen().await?;
-        if remote_rx.is_some() && (self.config.on_demand_loading()
-            || self.config.whisper.gpu_isolation
-            || self.config.whisper.eager_processing
-            || self.config.whisper.secondary_model.is_some()
-            || self.config.meeting.enabled
-            || (self.config.engine != crate::config::TranscriptionEngine::Parakeet
-                && transcriber_preloaded.as_ref().is_some_and(|t| t.as_streaming().is_some()))) {
+        if remote_rx.is_some()
+            && (self.config.on_demand_loading()
+                || self.config.whisper.gpu_isolation
+                || self.config.whisper.eager_processing
+                || self.config.whisper.secondary_model.is_some()
+                || self.config.meeting.enabled
+                || (self.config.engine != crate::config::TranscriptionEngine::Parakeet
+                    && transcriber_preloaded
+                        .as_ref()
+                        .is_some_and(|t| t.as_streaming().is_some())))
+        {
             return Err(crate::error::VoxtypeError::Config(
                 "Mobile API requires a preloaded batch or Parakeet Unified streaming model, no GPU isolation, secondary model, eager processing or meeting mode".into()));
         }
@@ -3177,14 +3235,9 @@ impl Daemon {
                         (HotkeyEvent::Released, ActivationMode::PushToTalk) => {
                             tracing::debug!("Received HotkeyEvent::Released (push-to-talk), state.is_recording() = {}", state.is_recording());
                             if state.is_streaming() {
-                                tracing::debug!("Streaming push-to-talk released; closing audio capture and disowning session");
-                                self.stop_streaming_capture(&mut audio_capture).await;
-                                // Drop session/chain so the backend's
-                                // post-stop flush emission is dropped at
-                                // the event pump instead of typed.
-                                // Matches the SIGUSR2 stop path.
-                                streaming_session = None;
-                                streaming_chain = None;
+                                tracing::debug!("Streaming push-to-talk released; finishing capture");
+                                self.stop_streaming_capture(&mut audio_capture,
+                                    &mut streaming_session, &mut streaming_chain, true).await;
                             } else if let State::Recording { model_override, .. } = &state {
                                 let model_override = model_override.clone();
 
@@ -3377,7 +3430,8 @@ impl Daemon {
                                 }
                             } else if state.is_streaming() {
                                 tracing::info!("Toggle stop while streaming; closing capture");
-                                self.stop_streaming_capture(&mut audio_capture).await;
+                                self.stop_streaming_capture(&mut audio_capture,
+                                &mut streaming_session, &mut streaming_chain, false).await;
                             } else if let State::Recording { model_override: current_model_override, .. } = &state {
                                 let model_override = current_model_override.clone();
 
@@ -3656,7 +3710,8 @@ impl Daemon {
                                 "Recording timeout ({:.0}s limit) while streaming; closing capture",
                                 max_duration.as_secs_f32()
                             );
-                            self.stop_streaming_capture(&mut audio_capture).await;
+                            self.stop_streaming_capture(&mut audio_capture,
+                                &mut streaming_session, &mut streaming_chain, false).await;
                             continue;
                         }
 
@@ -3853,16 +3908,9 @@ impl Daemon {
                     if remote.is_some() { continue; }
                     tracing::debug!("Received SIGUSR2 (stop recording)");
                     if state.is_streaming() {
-                        tracing::info!("SIGUSR2 stop while streaming; closing capture and disowning session");
-                        self.stop_streaming_capture(&mut audio_capture).await;
-                        // Drop the typing surface synchronously so any
-                        // Final/Partial events the backend emits while
-                        // draining its internal buffer reach the event-pump
-                        // arm with `streaming_session = None` and get
-                        // discarded instead of typed into whatever window
-                        // has focus by then.
-                        streaming_session = None;
-                        streaming_chain = None;
+                        tracing::info!("SIGUSR2 stop while streaming; finishing capture");
+                        self.stop_streaming_capture(&mut audio_capture,
+                            &mut streaming_session, &mut streaming_chain, true).await;
                     } else if let State::Recording { model_override, .. } = &state {
                         let model_override = model_override.clone();
 
@@ -3964,13 +4012,12 @@ impl Daemon {
                             }
                         }
                         Some(StreamingEvent::Final { text, .. }) => {
-                            let text = if self.config.engine == crate::config::TranscriptionEngine::Parakeet {
-                                if let Some(s) = streaming_session.as_mut() { s.clear_partial(); }
-                                let text = self.text_processor.process(&text);
-                                if let Some(processor) = &self.post_processor {
-                                    processor.process(&text).await
-                                } else { text }
-                            } else { text };
+                            if self.config.engine == crate::config::TranscriptionEngine::Parakeet {
+                                self.complete_unified_desktop(&mut state, &mut audio_capture,
+                                    &mut streaming_handle, &mut streaming_session,
+                                    &mut streaming_chain, Ok(text)).await;
+                                continue;
+                            }
                             if let (Some(s), Some(chain)) =
                                 (streaming_session.as_mut(), streaming_chain.as_ref())
                             {
@@ -4021,6 +4068,12 @@ impl Daemon {
                                 self.config.engine,
                                 "critical",
                             ).await;
+                            if self.config.engine == crate::config::TranscriptionEngine::Parakeet {
+                                self.complete_unified_desktop(&mut state, &mut audio_capture,
+                                    &mut streaming_handle, &mut streaming_session,
+                                    &mut streaming_chain, Err(err)).await;
+                                continue;
+                            }
                             self.end_streaming(
                                 &mut state,
                                 &mut audio_capture,
@@ -4030,6 +4083,13 @@ impl Daemon {
                             ).await;
                         }
                         Some(StreamingEvent::Ended) | None => {
+                            if self.config.engine == crate::config::TranscriptionEngine::Parakeet {
+                                // Empty/silent streams emit Ended without a Final.
+                                self.complete_unified_desktop(&mut state, &mut audio_capture,
+                                    &mut streaming_handle, &mut streaming_session,
+                                    &mut streaming_chain, Ok(String::new())).await;
+                                continue;
+                            }
                             self.end_streaming(
                                 &mut state,
                                 &mut audio_capture,
@@ -4354,6 +4414,196 @@ mod tests {
     use super::*;
     use std::fs;
     use tempfile::TempDir;
+
+    // The desktop pipeline consumes runtime CLI sentinels. Test it in a child
+    // process so even a normal cargo test cannot touch a running user's daemon.
+    fn isolated_desktop_test(name: &str) -> bool {
+        if std::env::var("VOXTYPE_DESKTOP_REGRESSION_CHILD").as_deref() == Ok(name) {
+            return false;
+        }
+        let runtime = TempDir::new().unwrap();
+        let result = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("daemon::tests::{name}"), "--nocapture"])
+            .env("VOXTYPE_DESKTOP_REGRESSION_CHILD", name)
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&result.stdout),
+            String::from_utf8_lossy(&result.stderr)
+        );
+        true
+    }
+
+    fn unified_desktop_fixture(dir: &Path) -> (Daemon, State) {
+        let mut config = Config::default();
+        config.engine = crate::config::TranscriptionEngine::Parakeet;
+        config.vad.enabled = false;
+        config.audio.feedback.enabled = false;
+        config.output.notification.on_recording_stop = false;
+        config.output.mode = OutputMode::File;
+        config.output.file_path = Some(dir.join("transcript.txt"));
+        config.state_file = Some(dir.join("state").to_string_lossy().into_owned());
+        config
+            .text
+            .replacements
+            .insert("voxtype".into(), "Voxtype".into());
+        (
+            Daemon::new(config, None),
+            State::Streaming {
+                started_at: Instant::now(),
+                model_override: None,
+                partial_buffer: String::new(),
+                finalized_text: String::new(),
+                typed_chars: 0,
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn unified_desktop_stop_preserves_final_and_normal_output() {
+        if isolated_desktop_test("unified_desktop_stop_preserves_final_and_normal_output") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let (mut daemon, mut state) = unified_desktop_fixture(dir.path());
+        let mut capture = None;
+        let mut session = Some(StreamingSession::new());
+        session
+            .as_mut()
+            .unwrap()
+            .observe_partial("a revisable preview".into());
+        let mut chain = Some(Vec::new());
+        daemon
+            .stop_streaming_capture(&mut capture, &mut session, &mut chain, true)
+            .await;
+        assert!(
+            session.is_some() && chain.is_some(),
+            "stop must retain the pending final"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.path().join("state")).unwrap().trim(),
+            "transcribing"
+        );
+        assert!(!dir.path().join("transcript.txt").exists());
+
+        let (events_tx, events) = tokio::sync::mpsc::channel(2);
+        let (cancel, _) = tokio::sync::oneshot::channel();
+        let output = dir.path().join("transcript.txt");
+        let mut handle = Some(StreamHandle {
+            events,
+            cancel,
+            task: tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                assert!(
+                    !output.exists(),
+                    "must join inference before output/admission"
+                );
+                drop(events_tx);
+                Ok(())
+            }),
+        });
+        daemon
+            .complete_unified_desktop(
+                &mut state,
+                &mut capture,
+                &mut handle,
+                &mut session,
+                &mut chain,
+                Ok("hello voxtype".into()),
+            )
+            .await;
+        assert_eq!(
+            fs::read_to_string(dir.path().join("transcript.txt"))
+                .unwrap()
+                .trim(),
+            "hello Voxtype"
+        );
+        assert!(state.is_idle() && handle.is_none() && session.is_none() && chain.is_none());
+        assert_eq!(
+            fs::read_to_string(dir.path().join("state")).unwrap().trim(),
+            "idle"
+        );
+    }
+
+    #[tokio::test]
+    async fn unified_desktop_cancel_discards_preview_and_joins_worker() {
+        if isolated_desktop_test("unified_desktop_cancel_discards_preview_and_joins_worker") {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let (mut daemon, mut state) = unified_desktop_fixture(dir.path());
+        let mut capture = None;
+        let mut session = Some(StreamingSession::new());
+        session
+            .as_mut()
+            .unwrap()
+            .observe_partial("must not insert".into());
+        let mut chain = Some(Vec::new());
+        let (events_tx, events) = tokio::sync::mpsc::channel(2);
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let joined = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = joined.clone();
+        let mut handle = Some(StreamHandle {
+            events,
+            cancel,
+            task: tokio::spawn(async move {
+                cancelled.await.unwrap();
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                drop(events_tx);
+                Ok(())
+            }),
+        });
+        daemon
+            .cancel_streaming_to_idle(
+                &mut state,
+                &mut capture,
+                &mut handle,
+                &mut session,
+                &mut chain,
+                "test",
+            )
+            .await;
+        assert!(joined.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(state.is_idle() && handle.is_none());
+        assert!(!dir.path().join("transcript.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn unified_desktop_empty_or_failed_result_never_commits_preview() {
+        if isolated_desktop_test("unified_desktop_empty_or_failed_result_never_commits_preview") {
+            return;
+        }
+        for result in [
+            Ok(String::new()),
+            Err(crate::error::TranscribeError::InferenceFailed(
+                "test".into(),
+            )),
+        ] {
+            let dir = TempDir::new().unwrap();
+            let (mut daemon, mut state) = unified_desktop_fixture(dir.path());
+            let mut session = Some(StreamingSession::new());
+            session
+                .as_mut()
+                .unwrap()
+                .observe_partial("must not insert".into());
+            daemon
+                .complete_unified_desktop(
+                    &mut state,
+                    &mut None,
+                    &mut None,
+                    &mut session,
+                    &mut Some(Vec::new()),
+                    result,
+                )
+                .await;
+            assert!(state.is_idle() && session.is_none());
+            assert!(!dir.path().join("transcript.txt").exists());
+        }
+    }
 
     // Helper to create a test runtime directory and set it up
     fn with_test_runtime_dir<F, R>(f: F) -> R

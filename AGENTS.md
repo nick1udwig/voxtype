@@ -15,6 +15,7 @@ Focused tests (fake models only):
 
     cargo test --locked --features parakeet --lib remote::
     cargo test --locked --features parakeet --lib parakeet_streaming
+    cargo test --locked --features parakeet --lib unified_desktop
 
 Follow CONTRIBUTING.md for upstream review gates; submit to upstream `dev`.
 Never start a real model alongside an already-running daemon for a test.

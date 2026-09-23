@@ -123,6 +123,12 @@ Streaming backends other than Parakeet Unified, on-demand loading, GPU isolation
 eager processing, meeting mode and secondary models are rejected. No fallback
 model loads. Desktop Parakeet sessions also commit only the completed transcript,
 so cumulative previews never cause duplicate typing and hold-to-talk remains usable.
+Desktop Unified stop/release retains the final destination and joins its worker
+before passing the complete transcript to the normal desktop output pipeline.
+This preserves CLI overrides, modifier-release handling, profiles and file
+completion results. Its public state is `recording` while capturing and
+`transcribing` while draining, for existing status-bar consumers. Explicit cancel
+still discards the pending result. Phone sessions never use this desktop pipeline.
 
 ## Timing diagnostics
 
