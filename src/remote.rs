@@ -19,6 +19,8 @@ use tokio_tungstenite::{
     },
 };
 
+mod resume;
+
 pub enum Input {
     Audio(Vec<f32>),
     Finish,
@@ -74,6 +76,7 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
     let (tx, rx) = mpsc::channel::<RequestSession>(4);
     let slots = Arc::new(Semaphore::new(4));
     let auth = Arc::new(format!("Bearer {token}"));
+    let resumes = Arc::new(resume::Registry::default());
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
             // Small audio and result frames should be forwarded promptly.
@@ -83,6 +86,7 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
             };
             let tx = tx.clone();
             let auth = auth.clone();
+            let resumes = resumes.clone();
             tokio::spawn(async move {
                 let _permit = permit;
                 let config = WebSocketConfig {
@@ -90,6 +94,8 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                     max_frame_size: Some(65536),
                     ..Default::default()
                 };
+                let session_id = Arc::new(std::sync::Mutex::new(None::<String>));
+                let header_id = session_id.clone();
                 let handshake = accept_hdr_async_with_config(
                     socket,
                     move |req: &Request, response: Response| {
@@ -107,6 +113,16 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                                 .body(Some("Unauthorized".into()))
                                 .unwrap());
                         }
+                        if let Some(id) = req.headers().get("x-voxtype-session") {
+                            let id = id.to_str().unwrap_or("");
+                            if !resume::valid_id(id) {
+                                return Err(Response::builder()
+                                    .status(400)
+                                    .body(Some("Invalid session".into()))
+                                    .unwrap());
+                            }
+                            *header_id.lock().unwrap() = Some(id.to_owned());
+                        }
                         Ok(response)
                     },
                     Some(config),
@@ -115,6 +131,11 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                 else {
                     return;
                 };
+                let id = session_id.lock().unwrap().take();
+                if let Some(id) = id {
+                    resumes.connect(id, tx, ws).await;
+                    return;
+                }
                 let (reply, answer) = oneshot::channel();
                 if tx.try_send(RequestSession { reply }).is_err() {
                     return;
@@ -652,6 +673,183 @@ mod tests {
             Ok("hello".into())
         }
     }
+    type TestSocket = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+    async fn resume_socket(url: &str, id: &str) -> TestSocket {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut request = url.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", "Bearer resume-test".parse().unwrap());
+        request
+            .headers_mut()
+            .insert("X-Voxtype-Session", id.parse().unwrap());
+        tokio_tungstenite::connect_async(request).await.unwrap().0
+    }
+    async fn next_event(ws: &mut TestSocket) -> Value {
+        let message = tokio::time::timeout(Duration::from_secs(3), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&message.into_text().unwrap()).unwrap()
+    }
+    async fn send_offset(ws: &mut TestSocket, offset: u64, length: usize) {
+        let mut data = offset.to_be_bytes().to_vec();
+        data.extend(vec![0; length]);
+        ws.send(Message::Binary(data)).await.unwrap();
+    }
+    async fn resumable_server() -> (String, Arc<StreamFake>, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1/dictate", listener.local_addr().unwrap());
+        let mut requests = serve(listener, "resume-test".into());
+        let model = Arc::new(StreamFake::new(false));
+        let shared = model.clone();
+        let supervisor = tokio::spawn(async move {
+            let mut active: Option<Session> = None;
+            loop {
+                tokio::select! {
+                    request = requests.recv() => {
+                        let Some(request) = request else { break; };
+                        if active.is_some() { let _ = request.reply.send(Err("busy")); }
+                        else {
+                            let (session, admission) = start(shared.clone(), None, 60);
+                            active = Some(session);
+                            let _ = request.reply.send(Ok(admission));
+                        }
+                    }
+                    result = async { (&mut active.as_mut().unwrap().task).await }, if active.is_some() => {
+                        let session = active.take().unwrap();
+                        let event = match result {
+                            Ok(Ok(Some(text))) => json!({"type":"final","text":text}),
+                            _ => json!({"type":"error","code":"transcription_failed"}),
+                        };
+                        let _ = session.events.send(event).await;
+                    }
+                }
+            }
+        });
+        (url, model, supervisor)
+    }
+    async fn final_event(ws: &mut TestSocket) -> Value {
+        loop {
+            let event = next_event(ws).await;
+            if event["type"] != "partial" {
+                return event;
+            }
+        }
+    }
+    #[tokio::test]
+    async fn resume_after_disconnect_continues_same_worker_without_replaying_audio() {
+        let (url, model, supervisor) = resumable_server().await;
+        let id = "11111111111111111111111111111111";
+        let mut ws = resume_socket(&url, id).await;
+        assert_eq!(next_event(&mut ws).await["resume"], true);
+        send_offset(&mut ws, 0, 3200).await;
+        assert_eq!(next_event(&mut ws).await["type"], "partial");
+        drop(ws);
+        let mut resumed = resume_socket(&url, id).await;
+        assert_eq!(next_event(&mut resumed).await["accepted_bytes"], 3200);
+        send_offset(&mut resumed, 0, 3200).await; // Duplicate must not reach inference.
+        send_offset(&mut resumed, 3200, 1600).await;
+        resumed
+            .send(Message::Text(r#"{"type":"finish"}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(final_event(&mut resumed).await["text"], "hello world");
+        assert_eq!(model.samples.load(Ordering::SeqCst), 2400);
+        assert_eq!(model.starts.load(Ordering::SeqCst), 1);
+        assert_eq!(model.active.load(Ordering::SeqCst), 0);
+        supervisor.abort();
+    }
+    #[tokio::test]
+    async fn completed_transcript_survives_lost_delivery_without_new_inference() {
+        let (url, model, supervisor) = resumable_server().await;
+        let id = "22222222222222222222222222222222";
+        let mut ws = resume_socket(&url, id).await;
+        next_event(&mut ws).await;
+        send_offset(&mut ws, 0, 3200).await;
+        ws.send(Message::Text(r#"{"type":"finish"}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(final_event(&mut ws).await["type"], "final");
+        drop(ws); // No result acknowledgement: model result must remain cached.
+        let mut resumed = resume_socket(&url, id).await;
+        let ready = next_event(&mut resumed).await;
+        assert_eq!(ready["finished"], true);
+        assert_eq!(ready["accepted_bytes"], 3200);
+        assert_eq!(final_event(&mut resumed).await["text"], "hello world");
+        assert_eq!(model.starts.load(Ordering::SeqCst), 1);
+        resumed
+            .send(Message::Text(r#"{"type":"ack"}"#.into()))
+            .await
+            .unwrap();
+        supervisor.abort();
+    }
+    #[tokio::test]
+    async fn replaced_socket_cannot_cancel_or_append_to_new_attachment() {
+        let (url, model, supervisor) = resumable_server().await;
+        let id = "33333333333333333333333333333333";
+        let mut old = resume_socket(&url, id).await;
+        next_event(&mut old).await;
+        send_offset(&mut old, 0, 3200).await;
+        next_event(&mut old).await;
+        let mut new = resume_socket(&url, id).await;
+        assert_eq!(next_event(&mut new).await["accepted_bytes"], 3200);
+        let _ = old.send(Message::Text(r#"{"type":"cancel"}"#.into())).await;
+        drop(old);
+        send_offset(&mut new, 3200, 3200).await;
+        new.send(Message::Text(r#"{"type":"finish"}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(final_event(&mut new).await["type"], "final");
+        assert_eq!(model.samples.load(Ordering::SeqCst), 3200);
+        assert_eq!(model.starts.load(Ordering::SeqCst), 1);
+        supervisor.abort();
+    }
+    #[tokio::test]
+    async fn resumed_audio_gap_is_rejected_without_a_partial_success() {
+        let (url, model, supervisor) = resumable_server().await;
+        let mut ws = resume_socket(&url, "44444444444444444444444444444444").await;
+        next_event(&mut ws).await;
+        send_offset(&mut ws, 2, 3200).await;
+        assert_eq!(final_event(&mut ws).await["code"], "invalid_audio_offset");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(model.active.load(Ordering::SeqCst), 0);
+        assert_eq!(model.samples.load(Ordering::SeqCst), 0);
+        supervisor.abort();
+    }
+
+    #[tokio::test]
+    async fn resumed_cancel_releases_worker_before_next_dictation() {
+        let (url, model, supervisor) = resumable_server().await;
+        let mut ws = resume_socket(&url, "55555555555555555555555555555555").await;
+        next_event(&mut ws).await;
+        send_offset(&mut ws, 0, 3200).await;
+        next_event(&mut ws).await;
+        ws.send(Message::Text(r#"{"type":"cancel"}"#.into()))
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while model.active.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(model.cancelled.load(Ordering::SeqCst), 1);
+        let mut next = resume_socket(&url, "66666666666666666666666666666666").await;
+        assert_eq!(next_event(&mut next).await["type"], "ready");
+        next.send(Message::Text(r#"{"type":"finish"}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(final_event(&mut next).await["type"], "final");
+        assert_eq!(model.starts.load(Ordering::SeqCst), 2);
+        assert_eq!(model.active.load(Ordering::SeqCst), 0);
+        supervisor.abort();
+    }
+
     #[test]
     fn pcm_and_auth() {
         assert_eq!(

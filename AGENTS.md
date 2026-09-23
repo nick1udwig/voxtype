@@ -13,7 +13,7 @@ output context. Final processing still uses the daemon's text/post processors.
 Protocol and standalone configuration: `docs/remote-api.md`.
 Focused tests (fake models only):
 
-    cargo test --locked --features parakeet --lib remote::tests
+    cargo test --locked --features parakeet --lib remote::
     cargo test --locked --features parakeet --lib parakeet_streaming
 
 Follow CONTRIBUTING.md for upstream review gates; submit to upstream `dev`.
