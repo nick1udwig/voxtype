@@ -76,6 +76,8 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
     let auth = Arc::new(format!("Bearer {token}"));
     tokio::spawn(async move {
         while let Ok((socket, _)) = listener.accept().await {
+            // Small audio and result frames should be forwarded promptly.
+            let _ = socket.set_nodelay(true);
             let Ok(permit) = slots.clone().try_acquire_owned() else {
                 continue;
             };
@@ -135,12 +137,24 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                 tokio::pin!(deadline);
                 let mut finished = false;
                 let mut pending = None;
+                let started = std::time::Instant::now();
+                let mut received_samples = 0usize;
+                let mut finish_received: Option<std::time::Instant> = None;
                 loop {
                     tokio::select! {
                         _ = &mut deadline => break,
                         event = events.recv() => {
                             let Some(event) = event else { break };
                             let terminal = event["type"] == "final" || event["type"] == "error";
+                            if terminal {
+                                tracing::info!(
+                                    audio_secs = received_samples as f64 / 16000.0,
+                                    elapsed_ms = started.elapsed().as_millis() as u64,
+                                    after_finish_ms = finish_received.map(|t| t.elapsed().as_millis() as u64),
+                                    result = event["type"].as_str().unwrap_or("unknown"),
+                                    "Mobile transport completed"
+                                );
+                            }
                             if !matches!(tokio::time::timeout(Duration::from_secs(5), ws.send(Message::Text(event.to_string()))).await, Ok(Ok(()))) { break }
                             if terminal { let _ = ws.close(None).await; break }
                         }
@@ -151,13 +165,18 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                         message = ws.next(), if pending.is_none() => match message {
                             Some(Ok(Message::Binary(bytes))) if !finished => {
                                 let Ok(samples) = decode_pcm(&bytes) else { break };
+                                received_samples += samples.len();
                                 // Backpressure the socket while continuing to drain result events.
                                 // One pending frame plus the bounded channel; no audio is dropped.
                                 pending = Some(Input::Audio(samples));
                             }
                             Some(Ok(Message::Text(text))) if !finished => {
                                 match serde_json::from_str::<Value>(&text).ok().and_then(|v| v["type"].as_str().map(str::to_owned)).as_deref() {
-                                    Some("finish") => { finished = true; pending = Some(Input::Finish); },
+                                    Some("finish") => {
+                                        finish_received = Some(std::time::Instant::now());
+                                        finished = true;
+                                        pending = Some(Input::Finish);
+                                    },
                                     _ => break, // includes explicit cancel
                                 }
                             }
@@ -240,6 +259,10 @@ async fn recognize_streaming(
     let mut pending = None;
     let mut count = 0;
     let mut final_text = None;
+    let started = std::time::Instant::now();
+    let mut finish_received: Option<std::time::Instant> = None;
+    let mut capacity_wait_started = None;
+    let mut capacity_wait = Duration::ZERO;
     // Allow catch-up after a slow decoder or a burst of buffered phone audio.
     let deadline = tokio::time::sleep(Duration::from_secs(max_secs as u64 + 180));
     tokio::pin!(deadline);
@@ -250,7 +273,12 @@ async fn recognize_streaming(
             _ = &mut deadline => break Err("recording_timeout".to_string()),
             permit = async { audio.as_ref().unwrap().clone().reserve_owned().await }, if pending.is_some() => {
                 match permit {
-                    Ok(permit) => { permit.send(pending.take().unwrap()); },
+                    Ok(permit) => {
+                        if let Some(since) = capacity_wait_started.take() {
+                            capacity_wait += std::time::Instant::now() - since;
+                        }
+                        permit.send(pending.take().unwrap());
+                    },
                     Err(_) => break Err("stream_ended_early".into()),
                 }
             },
@@ -262,8 +290,12 @@ async fn recognize_streaming(
                     // Waiting for capacity must not block consuming backend events:
                     // some backends wait for an event consumer before reading more audio.
                     pending = Some(chunk);
+                    capacity_wait_started = Some(std::time::Instant::now());
                 }
-                Some(Input::Finish) => { audio.take(); }
+                Some(Input::Finish) => {
+                    finish_received = Some(std::time::Instant::now());
+                    audio.take();
+                }
                 None => break Ok(None),
             },
             event = stream_events.recv() => match event {
@@ -293,6 +325,14 @@ async fn recognize_streaming(
         .await
         .map_err(|e| e.to_string())
         .and_then(|r| r.map_err(|e| e.to_string()));
+    tracing::info!(
+        audio_secs = count as f64 / 16000.0,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        after_finish_ms = finish_received.map(|t| t.elapsed().as_millis() as u64),
+        capacity_wait_ms = capacity_wait.as_millis() as u64,
+        completed = matches!(outcome, Ok(Some(_))) && joined.is_ok(),
+        "Mobile streaming worker completed"
+    );
     if matches!(outcome, Ok(Some(_))) {
         joined?;
     }

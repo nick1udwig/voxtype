@@ -71,3 +71,14 @@ Streaming backends other than Parakeet Unified, on-demand loading, GPU isolation
 eager processing, meeting mode and secondary models are rejected. No fallback
 model loads. Desktop Parakeet sessions also commit only the completed transcript,
 so cumulative previews never cause duplicate typing and hold-to-talk remains usable.
+
+## Timing diagnostics
+
+Completion logs contain only counters and durations, never transcript text or
+authentication data. `Mobile transport completed` reports received audio seconds,
+wall time and time from receiving `finish` to the terminal event. `Mobile
+streaming worker completed` reports its corresponding timings and accumulated
+wait for inference queue capacity. A large transport/worker timing gap suggests
+queue drain or daemon post-processing; low daemon times with high phone delay
+suggest transport or client/editor work. Cancellation can omit a terminal
+transport record while still producing the worker completion record.
