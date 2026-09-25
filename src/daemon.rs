@@ -3041,7 +3041,7 @@ impl Daemon {
                     }
                 } => {
                     if request.reply.is_closed() { continue; }
-                    if remote.is_some() || !state.is_idle() || self.transcription_task.is_some() || self.meeting_active() {
+                    if remote.is_some() || !state.is_idle() || streaming_handle.is_some() || self.transcription_task.is_some() || self.meeting_active() {
                         let _ = request.reply.send(Err("busy"));
                         continue;
                     }
@@ -3583,6 +3583,19 @@ impl Daemon {
                 _ = tokio::time::sleep(Duration::from_millis(100)), if state.is_recording() => {
                     // Check for cancel request first
                     if check_cancel_requested() {
+                        if state.is_streaming() {
+                            // Unified stays in Streaming while its final inference
+                            // drains. Join that worker before reopening admission.
+                            self.cancel_streaming_to_idle(
+                                &mut state,
+                                &mut audio_capture,
+                                &mut streaming_handle,
+                                &mut streaming_session,
+                                &mut streaming_chain,
+                                "Recording discarded",
+                            ).await;
+                            continue;
+                        }
                         tracing::info!("Recording cancelled");
 
                         // Stop recording and discard audio
@@ -4569,6 +4582,70 @@ mod tests {
             .await;
         assert!(joined.load(std::sync::atomic::Ordering::SeqCst));
         assert!(state.is_idle() && handle.is_none());
+        assert!(!dir.path().join("transcript.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn unified_desktop_cancel_during_final_inference_keeps_admission_busy() {
+        if isolated_desktop_test(
+            "unified_desktop_cancel_during_final_inference_keeps_admission_busy",
+        ) {
+            return;
+        }
+        let dir = TempDir::new().unwrap();
+        let (mut daemon, mut state) = unified_desktop_fixture(dir.path());
+        let mut capture = None;
+        let mut session = Some(StreamingSession::new());
+        session
+            .as_mut()
+            .unwrap()
+            .observe_partial("discard me".into());
+        let mut chain = Some(Vec::new());
+        daemon
+            .stop_streaming_capture(&mut capture, &mut session, &mut chain, true)
+            .await;
+        // The file cancel poll must still handle this state after recording stops.
+        assert!(state.is_recording() && state.is_streaming());
+
+        let (events_tx, events) = tokio::sync::mpsc::channel(2);
+        let (cancel, cancelled) = tokio::sync::oneshot::channel();
+        let (release, draining) = tokio::sync::oneshot::channel();
+        let mut handle = Some(StreamHandle {
+            events,
+            cancel,
+            task: tokio::spawn(async move {
+                cancelled.await.unwrap();
+                draining.await.unwrap();
+                drop(events_tx);
+                Ok(())
+            }),
+        });
+        {
+            let cancellation = daemon.cancel_streaming_to_idle(
+                &mut state,
+                &mut capture,
+                &mut handle,
+                &mut session,
+                &mut chain,
+                "Recording discarded",
+            );
+            tokio::pin!(cancellation);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), &mut cancellation)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                fs::read_to_string(dir.path().join("state")).unwrap().trim(),
+                "transcribing",
+                "admission must stay busy until inference has joined"
+            );
+            release.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(2), cancellation)
+                .await
+                .unwrap();
+        }
+        assert!(state.is_idle() && handle.is_none() && session.is_none() && chain.is_none());
         assert!(!dir.path().join("transcript.txt").exists());
     }
 
