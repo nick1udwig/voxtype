@@ -3013,6 +3013,8 @@ impl Daemon {
         let mut remote_rx = crate::remote::listen().await?;
         if remote_rx.is_some()
             && (self.config.on_demand_loading()
+                || (self.config.engine == crate::config::TranscriptionEngine::Whisper
+                    && self.config.whisper.effective_mode() == crate::config::WhisperMode::Cli)
                 || self.config.whisper.gpu_isolation
                 || self.config.whisper.eager_processing
                 || self.config.whisper.secondary_model.is_some()
@@ -3023,7 +3025,7 @@ impl Daemon {
                         .is_some_and(|t| t.as_streaming().is_some())))
         {
             return Err(crate::error::VoxtypeError::Config(
-                "Mobile API requires a preloaded batch or Parakeet Unified streaming model, no GPU isolation, secondary model, eager processing or meeting mode".into()));
+                "Mobile API requires a preloaded batch or Parakeet Unified streaming model, no Whisper CLI mode, GPU isolation, secondary model, eager processing or meeting mode".into()));
         }
         let mut remote: Option<crate::remote::Session> = None;
 

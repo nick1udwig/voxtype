@@ -119,10 +119,11 @@ The configured VAD, text replacement/punctuation processor and post-processing
 command are reused. Desktop context, CLI output overrides, typing, clipboard,
 notifications, hooks and auto-submit are not invoked for phone sessions.
 
-Streaming backends other than Parakeet Unified, on-demand loading, GPU isolation,
-eager processing, meeting mode and secondary models are rejected. No fallback
-model loads. Desktop Parakeet sessions also commit only the completed transcript,
-so cumulative previews never cause duplicate typing and hold-to-talk remains usable.
+Streaming backends other than Parakeet Unified, Whisper CLI mode, on-demand
+loading, GPU isolation, eager processing, meeting mode and secondary models are
+rejected. No fallback model loads. Desktop Parakeet sessions also commit only
+the completed transcript, so cumulative previews never cause duplicate typing
+and hold-to-talk remains usable.
 Desktop Unified stop/release retains the final destination and joins its worker
 before passing the complete transcript to the normal desktop output pipeline.
 This preserves CLI overrides, modifier-release handling, profiles and file
