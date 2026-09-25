@@ -411,6 +411,9 @@ async fn recognize(
     match finish {
         Ok(false) => Ok(None),
         Err(code) => Err(code.into()),
+        // A cancel/disconnect can close events while we join the preview after
+        // Finish. Do not start another inference for an abandoned recording.
+        Ok(true) if events.is_closed() => Ok(None),
         Ok(true) if samples.len() < 4800 => Ok(Some(String::new())),
         Ok(true) => {
             if let Some(vad) = vad {
@@ -890,6 +893,63 @@ mod tests {
         drop(a);
         assert!(session.task.await.unwrap().unwrap().is_none());
         assert_eq!(model.active.load(Ordering::SeqCst), 0);
+        assert_eq!(Arc::strong_count(&model), 1);
+    }
+    #[tokio::test]
+    async fn cancel_after_finish_joins_preview_without_starting_final_inference() {
+        struct GatedFake {
+            calls: AtomicUsize,
+            started: tokio::sync::Notify,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+        }
+        impl Transcriber for GatedFake {
+            fn transcribe(&self, _: &[f32]) -> Result<String, crate::error::TranscribeError> {
+                if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    self.started.notify_one();
+                    self.release
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(5))
+                        .unwrap();
+                }
+                Ok("hello".into())
+            }
+        }
+        let (release, wait) = std::sync::mpsc::channel();
+        let model = Arc::new(GatedFake {
+            calls: AtomicUsize::new(0),
+            started: tokio::sync::Notify::new(),
+            release: std::sync::Mutex::new(wait),
+        });
+        let (mut session, a) = start(model.clone(), None, 5);
+        a.audio.send(Input::Audio(vec![0.1; 32000])).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), model.started.notified())
+            .await
+            .unwrap();
+        a.audio.send(Input::Finish).await.unwrap();
+        // Wait until Finish is consumed and recognition is joining the preview.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while a.audio.capacity() != a.audio.max_capacity() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(a);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut session.task)
+                .await
+                .is_err(),
+            "cancellation must join the preview before releasing admission"
+        );
+        release.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(2), session.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .is_none());
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
         assert_eq!(Arc::strong_count(&model), 1);
     }
     #[tokio::test]
