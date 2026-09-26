@@ -141,3 +141,17 @@ wait for inference queue capacity. A large transport/worker timing gap suggests
 queue drain or daemon post-processing; low daemon times with high phone delay
 suggest transport or client/editor work. Cancellation can omit a terminal
 transport record while still producing the worker completion record.
+
+## Capability discovery
+
+Backend integrations can open `ws://127.0.0.1:8765/v1/capabilities` with the same
+Authorization header and no Origin. The daemon sends one JSON event and closes:
+
+```json
+{"type":"capabilities","protocol":1,"dictation":true,"sample_rate":16000,"channels":1,"format":"pcm_s16le","results":["partial","final"],"max_seconds":300,"resume":true}
+```
+
+Discovery does not request admission, load a model or interrupt active dictation.
+It advertises protocol support; `/v1/dictate` still checks current admission and
+can return busy. Termai authenticates locally, streams browser PCM to this daemon,
+and consumes results on its backend. Daemon credentials never reach the browser.

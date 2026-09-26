@@ -96,6 +96,8 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                 };
                 let session_id = Arc::new(std::sync::Mutex::new(None::<String>));
                 let header_id = session_id.clone();
+                let capabilities = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let header_capabilities = capabilities.clone();
                 let handshake = accept_hdr_async_with_config(
                     socket,
                     move |req: &Request, response: Response| {
@@ -104,7 +106,7 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                             .get("authorization")
                             .and_then(|v| v.to_str().ok())
                             .unwrap_or("");
-                        if req.uri().path() != "/v1/dictate"
+                        if !matches!(req.uri().path(), "/v1/dictate" | "/v1/capabilities")
                             || req.headers().contains_key("origin")
                             || !equal_secret(supplied.as_bytes(), auth.as_bytes())
                         {
@@ -113,6 +115,10 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                                 .body(Some("Unauthorized".into()))
                                 .unwrap());
                         }
+                        header_capabilities.store(
+                            req.uri().path() == "/v1/capabilities",
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         if let Some(id) = req.headers().get("x-voxtype-session") {
                             let id = id.to_str().unwrap_or("");
                             if !resume::valid_id(id) {
@@ -131,6 +137,19 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                 else {
                     return;
                 };
+                if capabilities.load(std::sync::atomic::Ordering::Relaxed) {
+                    // Discovery never requests admission or touches the loaded model.
+                    let event = json!({"type":"capabilities", "protocol":1,
+                        "dictation":true, "sample_rate":16000, "channels":1,
+                        "format":"pcm_s16le", "results":["partial", "final"],
+                        "max_seconds":300, "resume":true});
+                    let _ = tokio::time::timeout(Duration::from_secs(5), async {
+                        ws.send(Message::Text(event.to_string())).await?;
+                        ws.close(None).await
+                    })
+                    .await;
+                    return;
+                }
                 let id = session_id.lock().unwrap().take();
                 if let Some(id) = id {
                     resumes.connect(id, tx, ws).await;
@@ -962,6 +981,34 @@ mod tests {
         a.audio.send(Input::Audio(vec![0.0; 16001])).await.unwrap();
         assert_eq!(session.task.await.unwrap().unwrap_err(), "audio_limit");
     }
+    #[tokio::test]
+    async fn capability_discovery_is_authenticated_and_does_not_request_model_admission() {
+        use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/v1/capabilities", listener.local_addr().unwrap());
+        let mut requests = serve(listener, "test-secret".into());
+        assert!(connect_async(&url).await.is_err());
+        let mut request = url.into_client_request().unwrap();
+        request
+            .headers_mut()
+            .insert("Authorization", "Bearer test-secret".parse().unwrap());
+        let mut browser = request.clone();
+        browser
+            .headers_mut()
+            .insert("Origin", "https://example.com".parse().unwrap());
+        assert!(connect_async(browser).await.is_err());
+        let (mut ws, _) = connect_async(request).await.unwrap();
+        let event: Value =
+            serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
+        assert_eq!(event["type"], "capabilities");
+        assert_eq!(event["dictation"], true);
+        assert_eq!(event["protocol"], 1);
+        assert_eq!(event["sample_rate"], 16000);
+        assert_eq!(event["format"], "pcm_s16le");
+        assert_eq!(event["results"], json!(["partial", "final"]));
+        assert!(requests.try_recv().is_err());
+    }
+
     #[tokio::test]
     async fn websocket_auth_audio_finish_and_disconnect() {
         use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
