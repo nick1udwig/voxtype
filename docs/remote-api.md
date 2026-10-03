@@ -1,140 +1,133 @@
-# Remote dictation API (protocol v1)
+# Remote dictation API (protocol 2, Opus only)
 
-This optional listener runs inside the existing Voxtype daemon. It accepts
-external audio through the daemon-owned transcriber and never loads a second
-model. Enable it by setting `VOXTYPE_REMOTE_TOKEN_FILE` to a private token file
-in the daemon process environment. `VOXTYPE_REMOTE_BIND` defaults to
-`127.0.0.1:8765`; only loopback addresses are accepted. Restart the existing
-daemon to enable it. Do not run a second daemon alongside it.
+The optional listener runs inside the existing Voxtype daemon and uses its
+already-loaded transcriber. It never creates a model or inference sidecar.
+Enable `VOXTYPE_REMOTE_TOKEN_FILE` with a mode 0600 generated token file;
+`VOXTYPE_REMOTE_BIND` defaults to `127.0.0.1:8765` and must be loopback.
+Replace/restart the existing daemon for upgrades; never run another alongside it.
 
-The direct endpoint is `ws://127.0.0.1:8765/v1/dictate`. Expose it only through
-a trusted authenticated private-network TLS proxy, such as Tailscale Serve.
-The following example uses a `/voxtype` proxy mount. Android is one possible
-client; the daemon and protocol build independently of any client repository.
+The route remains `ws://127.0.0.1:8765/v1/dictate` for proxy compatibility.
+Expose it through a trusted private-network TLS proxy, for example Tailscale
+Serve at `wss://HOST/voxtype/v1/dictate` (stripping `/voxtype`). No public
+Funnel, Origin header, query credentials or model overrides are accepted.
 
-`wss://HOST/voxtype/v1/dictate`, HTTP `Authorization: Bearer TOKEN`.
-TLS terminates at Tailscale Serve on port 443. It strips the `/voxtype` mount
-prefix and proxies `/v1/dictate` to `127.0.0.1:8765`.
-No Funnel, public port, browser origins, query-string credentials or model overrides.
-The listener exists only when `VOXTYPE_REMOTE_TOKEN_FILE` is set. Token files must
-have mode 0600; use a generated 32-byte random secret. The app encrypts its copy
-with Android Keystore and excludes app data from backup.
+## Admission and versioning
 
-By default, one WebSocket is one session. Opening it requests admission from the daemon's
-main event loop. A busy daemon responds `{"type":"error","code":"busy"}`.
-Only four authenticated/handshaking connections may be outstanding.
+Every dictation handshake requires these headers:
 
-1. Server: `{"type":"ready","protocol":1,"sample_rate":16000,"channels":1,"format":"pcm_s16le","preview":"streaming","max_seconds":300}`.
-   Batch models advertise `"preview":"batch_snapshot"`. Existing Android clients support both.
-2. Client: binary frames of signed 16-bit little-endian, mono, 16 kHz PCM.
-   The Android client captures immediately on button-down and retains at most
-   300 seconds of audio until completion or discard; it sends 100 ms frames. No WAV header.
-   Raw PCM remains the default; optional lossless framing is described below.
-3. Server: `{"type":"partial","text":"cumulative revisable text"}`.
-   Every partial replaces the whole preview. It is never inserted into the app.
-4. Client: `{"type":"finish"}` after the last audio frame.
-5. Server: `{"type":"final","text":"processed complete transcript"}`; closes.
-   Empty final means no speech/too short. An error is terminal.
+```text
+Authorization: Bearer TOKEN
+X-Voxtype-Protocol: 2
+X-Voxtype-Audio: opus_v1
+X-Voxtype-Session: 32 hexadecimal characters
+```
 
-Closing, disconnecting, or sending `{"type":"cancel"}` cancels the session.
-Clients may reconnect and replay the complete recording after a transient failure.
-A reconnect is a new session; retry `busy` with backoff until the prior worker
-has joined and released admission. The daemon never inserts text for a remote
-session. Clients must ignore events from abandoned connections and deliver at
-most one final result per user dictation. Partial text must never be used as a
-successful fallback result. Session resumption is opt-in as described below.
-Frames are limited to 64 KiB; queues and audio duration are bounded (at most
-300 seconds). Server holds admission until all inference has returned, even on
-cancellation. Inference cannot be forcibly interrupted safely; a hung backend
-keeps the daemon busy until its service is restarted.
+Protocol 1 raw PCM/zlib and nonresumable sessions have been removed. Missing or
+unsupported protocol/audio headers return HTTP 426 before model admission;
+a missing/invalid session ID returns HTTP 400. Android 0.1.9 and this daemon
+must be upgraded together. Clients must reject incompatible ready events and
+retain saved audio for manual recovery, with no PCM fallback or automatic
+version-error retry loop. Four authenticated/handshaking sockets may be active.
+The daemon dynamically loads the system Opus library (`libopus.so.0` on Linux,
+`libopus.0.dylib` on macOS). Install the runtime package (`opus` on Arch,
+`libopus0` on Debian/Ubuntu). Missing codec/API returns `codec_unavailable`
+before requesting model admission; restart after installing the codec.
 
-## Optional lossless PCM transport
+A busy daemon returns `{"type":"error","code":"busy"}`. An admitted or
+resumed session first receives:
 
-Send `X-Voxtype-Audio: pcm_s16le_zlib_v1` in the authenticated WebSocket handshake.
-Only use the encoded framing when the ready event acknowledges
-`"audio_encoding":"pcm_s16le_zlib_v1"`. Without this field (including older
-servers), send the existing raw PCM framing. Clients without the header retain
-the existing protocol. Discovery advertises supported `audio_encodings`;
-negotiation is per connection and must be checked again after every reconnect.
+```json
+{"type":"ready","protocol":2,"sample_rate":16000,"channels":1,"format":"opus","audio_encoding":"opus_v1","preview":"streaming","max_seconds":300,"resume":true,"accepted_frames":0,"finished":false,"framing":"sequence_opus_v1","max_encoded_bytes":2097152}
+```
 
-Each negotiated binary message contains this envelope, after the existing
-8-byte offset if session resumption is enabled:
+Batch models use `preview: batch_snapshot`. Partials remain cumulative revisable
+text and are never successful fallback finals. Only one processed `final`
+may be delivered to the editor for a user dictation; empty text means no speech.
+
+## Binary audio frames
+
+Opus packets represent mono 20 ms audio; inference receives decoded 16 kHz floats.
+No PCM, zlib, WAV/Ogg container or codec-config buffers appear on the wire.
+A binary WebSocket message contains exactly one complete frame:
 
 | Bytes | Meaning |
 | --- | --- |
-| 1 | Codec: `0` for raw PCM, `1` for one independent zlib stream |
-| 4 | Unsigned big-endian decoded PCM byte length |
-| Remaining | Exact raw PCM bytes or complete RFC 1950 zlib stream |
+| 8 | Unsigned big-endian frame sequence, beginning at 0 |
+| 1 | Envelope version 1 |
+| 1 | Flags: first=1, final=2; other bits forbidden |
+| 2 | Unsigned big-endian pre-skip in 48 kHz samples, first frame only |
+| 4 | Unsigned big-endian original 16 kHz source sample count, final frame only |
+| 1 | Packet count 0..5; zero permitted only on final frame |
+| Repeated | Unsigned big-endian u16 packet length, then packet bytes |
 
-Both codecs decode to the same signed 16-bit little-endian, mono, 16 kHz samples.
-The Android encoder uses zlib level 1 and falls back to codec 0 when compression
-does not shorten that frame. There is no shared dictionary or stream across
-messages. The decoded length must be nonzero, even and at most 65,522 bytes, so a
-raw fallback plus envelope and offset fits the existing 65,536-byte message cap.
-The server caps inflation before allocation and rejects invalid checksums,
-truncated streams, trailing data, concatenated streams and decoded-length
-mismatches. It does not construct a model; decoded PCM enters the existing
-bounded session and inference paths.
+Each packet is 1..1275 bytes, mono and exactly 20 ms. Frame size is 17..6402 bytes.
+The first flag is required exactly on sequence 0. Pre-skip must be divisible by 3
+and at most 3840 (80 ms); the decoded sample rate remains 16 kHz. Nonfirst pre-skip
+and nonfinal original count must be 0. Empty input may be a first + final frame
+with 0 packets, 0 pre-skip and 0 original samples. A final count must be restorable
+from actual decoded samples; it cannot invent audio. Trailing bytes, truncation,
+stereo, unsupported packet durations, overflows and changed boundaries fail.
 
-Offsets, `accepted_bytes` and recording-duration limits always count **decoded
-PCM bytes**, never envelope or compressed bytes. A checkpoint inside a retained
-client frame is handled by encoding its remaining PCM suffix as a fresh frame.
-The same session may reconnect with compression enabled or disabled; either
-connection continues at the canonical decoded-byte checkpoint.
+Android captures 16 kHz signed 16-bit microphone PCM and encodes during capture
+through platform MediaCodec `audio/opus`, target 24 kbit/s (Android 10+).
+Codec config is parsed rather than sent: `csd-1` native-order unsigned 64-bit
+nanosecond pre-skip overrides OpusHead, including unified AOPUSHDR/AOPUSDLY
+headers. The app pads with bounded zeros to cover the actual encoder delay,
+queues EOS and drains delayed output (each wait has a 5 second deadline), then
+marks the last retained packet aggregate final. Empty EOS is supported.
+The daemon removes pre-skip and trims the tail to exact original sample count;
+it retains one 20 ms decoded tail until final so empty EOS cannot require retracting
+model input. Source duration is at most 300 seconds, encoded recording at most
+2 MiB and 15002 frames. Decoded padding is bounded separately. Android retains
+encoded frames only. A bounded eight-chunk PCM handoff (100 ms per chunk)
+lets microphone capture begin before codec initialization and preserves a quick
+release during startup. One producer chunk and at most 5 pending encoded packets
+are retained in addition to this queue. Saturation during live capture fails
+explicitly without blocking microphone reads or returning truncated success;
+only the final marker may wait after capture stops. The app never re-encodes
+during reconnect. Opus is lossy.
 
-The fixed cross-language test vector encodes eight repetitions of the PCM bytes
-`00 80 ff 7f 00 00 01 00`. Its envelope and zlib stream are hexadecimal
-`010000004078016368f85fcfc0c0c8c040260d001f360ff9`.
+Platform codec application/VBR choices are device controlled. AOSP C2 uses
+APPLICATION_AUDIO and constrained VBR; earlier host benchmarks used VOIP and
+unconstrained VBR. Those timing/size numbers do not measure the phone encoder.
+See [MediaCodec config/EOS documentation](https://developer.android.com/reference/android/media/MediaCodec)
+and [AOSP Opus encoder](https://android.googlesource.com/platform/frameworks/av/+/1401a72389/media/codec2/components/opus/C2SoftOpusEnc.cpp).
 
-## Optional session resumption
+After the final frame, send `{"type":"finish"}`. Finish without an accepted
+final audio boundary fails with `incomplete_audio`. The daemon flushes the
+existing recognizer and emits `{"type":"final","text":"processed text"}`.
+Send `{"type":"ack"}` after accepting it, then close. Explicit cancel is
+`{"type":"cancel"}` and never produces editor output.
 
-Send `X-Voxtype-Session: ID` alongside the same bearer authorization. ID must be
-a random 32-character hexadecimal value, unique per user dictation. Never send
-it in the URL. A ready event adds these fields:
+## Resume, expiry and ownership
 
-```json
-{"resume":true,"accepted_bytes":96000,"finished":false,"framing":"offset_pcm_s16le"}
-```
+Each logical session actor owns its stateful Opus decoder, independent of
+sockets. Socket epoch and sequence checks run before native decoder mutation.
+A complete accepted frame advances `accepted_frames` by 1; duplicates with
+preceding sequence are ignored before decoding. Gaps fail with
+`invalid_audio_sequence`; invalid frames fail with `invalid_audio`. No partial
+frame reaches inference or advances the checkpoint. Reconnecting with the same
+ID retains codec state and the worker or cached final. The old socket loses its
+lease and cannot append, cancel or detach its replacement.
 
-These augment the normal protocol-1 ready event, including format and limits.
-If `resume` is absent, use the legacy raw PCM framing and full replay. With
-resumption enabled, every binary message is an unsigned 64-bit **big-endian PCM
-byte offset** followed by signed 16-bit **little-endian audio**. The offset counts
-only audio bytes, starting at zero. The complete message remains limited to
-64 KiB. Resume at `accepted_bytes`, which describes audio accepted into the
-bounded daemon spool, not necessarily already decoded. Gaps, overlapping frames,
-audio after finish and duration overflow are terminal errors. Entirely preceding
-duplicate frames are ignored. The checkpoint may fall inside a client frame.
+Resume from the advertised frame index; checkpoints never split frames. If
+`finished` is true, send no more audio/finish and wait for the cached final.
+After restart/expiry/eviction an absent ID starts with `accepted_frames:0`;
+replay the exact original encoded frames from sequence 0, including pre-skip.
+Keep the same ID for transport errors/busy; use a new ID after session/inference
+errors or pairing changes. Never create a fresh decoder for a retained suffix.
 
-Reconnecting with the same ID attaches to the same worker or cached result.
-The previous attachment loses its lease and cannot append audio, cancel or
-detach its replacement. If `finished` is true, send no audio or finish again;
-wait for the final. Otherwise send remaining PCM, then the normal finish control.
-The daemon repeats the latest partial or terminal event after ready. Clients must
-ignore stale callbacks and deliver only one final per user dictation.
-
-An unfinished disconnected session waits 30 seconds for reconnection (two seconds
-if no audio has arrived). Once finish is accepted, inference continues offline
-within the overall 480-second session limit. Final/error events are retained in
-memory for 90 seconds after completion. Send `{"type":"ack"}` after accepting
-the final to erase it early, then close. At most eight entries are retained;
-terminal entries can be evicted earlier under pressure. No transcript or audio
-is written to disk by this transport. Registry entries erase text on expiry even
-if no later connection arrives.
-
-Unlike a disconnect, explicit `{"type":"cancel"}` abandons the session. A new
-ID also abandons a disconnected unfinished predecessor; admission may return
-busy until its inference joins. Cancellation does not release model admission
-before the original worker has returned. Network loss can delay explicit cancel
-delivery; expiry bounds abandoned transport state.
-
-If a session is absent after restart/expiry/eviction, its ID starts a new admission
-with `accepted_bytes:0`. The client must retain the complete bounded recording
-until final delivery or discard. On `session_expired` or inference error, generate
-a fresh ID before retrying. Keep the same ID for transport failures and busy
-responses. Resumption never constructs a transcriber or introduces another model.
-The spool is limited to the advertised recording duration (at most 300 seconds /
-19.2 MB float PCM) with aggregated chunks and bounded forwarding queues.
+Unfinished disconnected sessions wait 30 seconds (2 seconds with no frames).
+Accepted finish permits offline inference within a 480 second overall deadline.
+Terminal results expire after 90 seconds; acknowledgment erases them early,
+and the bounded 8 entry cache may evict terminal results under pressure.
+Explicit cancel or a new ID abandoning a disconnected unfinished predecessor
+closes input, but daemon model admission remains held until in-flight inference
+joins. Network loss may delay cancellation until expiry. No audio or transcript
+is written to disk. Android process death loses its in-memory recording/result.
+The actor command queue has 8 slots plus one pending socket frame; the duration
+bounded float spool uses 100 ms chunks (at most 19.2 MB) and bounded worker queues.
+Backpressure keeps consuming result/cancel events so it cannot deadlock inference.
 
 ## Recognition and ownership
 
@@ -173,7 +166,7 @@ still discards the pending result. Phone sessions never use this desktop pipelin
 ## Timing diagnostics
 
 Completion logs contain only counters and durations, never transcript text or
-authentication data. `Mobile transport completed` reports received audio seconds,
+authentication data. `Mobile resumable session completed` reports received audio seconds,
 wall time and time from receiving `finish` to the terminal event. `Mobile
 streaming worker completed` reports its corresponding timings and accumulated
 wait for inference queue capacity. A large transport/worker timing gap suggests
@@ -183,14 +176,13 @@ transport record while still producing the worker completion record.
 
 ## Capability discovery
 
-Backend integrations can open `ws://127.0.0.1:8765/v1/capabilities` with the same
-Authorization header and no Origin. The daemon sends one JSON event and closes:
+Authenticated `ws://127.0.0.1:8765/v1/capabilities` sends one event and closes,
+without requesting admission or constructing a model:
 
 ```json
-{"type":"capabilities","protocol":1,"dictation":true,"sample_rate":16000,"channels":1,"format":"pcm_s16le","results":["partial","final"],"max_seconds":300,"resume":true,"audio_encodings":["pcm_s16le","pcm_s16le_zlib_v1"]}
+{"type":"capabilities","protocol":2,"dictation":true,"sample_rate":16000,"channels":1,"format":"opus","results":["partial","final"],"max_seconds":300,"resume":true,"audio_encodings":["opus_v1"],"framing":"sequence_opus_v1","max_encoded_bytes":2097152}
 ```
 
-Discovery does not request admission, load a model or interrupt active dictation.
-It advertises protocol support; `/v1/dictate` still checks current admission and
-can return busy. Termai authenticates locally, streams browser PCM to this daemon,
-and consumes results on its backend. Daemon credentials never reach the browser.
+Other backend integrations must upgrade to protocol 2, encode Opus, and retain
+complete frames for recovery. Existing protocol 1 integrations fail clearly;
+there is no maintained PCM client path. Credentials remain on the trusted backend.

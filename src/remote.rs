@@ -19,7 +19,7 @@ use tokio_tungstenite::{
     },
 };
 
-mod pcm;
+mod opus;
 mod resume;
 
 pub enum Input {
@@ -99,8 +99,6 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                 let header_id = session_id.clone();
                 let capabilities = Arc::new(std::sync::atomic::AtomicBool::new(false));
                 let header_capabilities = capabilities.clone();
-                let compression = Arc::new(std::sync::atomic::AtomicBool::new(false));
-                let header_compression = compression.clone();
                 let handshake = accept_hdr_async_with_config(
                     socket,
                     move |req: &Request, response: Response| {
@@ -122,19 +120,29 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                             req.uri().path() == "/v1/capabilities",
                             std::sync::atomic::Ordering::Relaxed,
                         );
-                        header_compression.store(
-                            req.headers()
-                                .get("x-voxtype-audio")
+                        if req.uri().path() == "/v1/dictate" {
+                            if req
+                                .headers()
+                                .get("x-voxtype-protocol")
                                 .and_then(|v| v.to_str().ok())
-                                == Some(pcm::ENCODING),
-                            std::sync::atomic::Ordering::Relaxed,
-                        );
-                        if let Some(id) = req.headers().get("x-voxtype-session") {
-                            let id = id.to_str().unwrap_or("");
+                                != Some("2")
+                                || req
+                                    .headers()
+                                    .get("x-voxtype-audio")
+                                    .and_then(|v| v.to_str().ok())
+                                    != Some(opus::ENCODING)
+                            {
+                                return Err(Response::builder().status(426).body(Some("Mobile protocol 2 with opus_v1 required; upgrade app and daemon together".into())).unwrap());
+                            }
+                            let id = req
+                                .headers()
+                                .get("x-voxtype-session")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("");
                             if !resume::valid_id(id) {
                                 return Err(Response::builder()
                                     .status(400)
-                                    .body(Some("Invalid session".into()))
+                                    .body(Some("Valid session ID required".into()))
                                     .unwrap());
                             }
                             *header_id.lock().unwrap() = Some(id.to_owned());
@@ -149,11 +157,11 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                 };
                 if capabilities.load(std::sync::atomic::Ordering::Relaxed) {
                     // Discovery never requests admission or touches the loaded model.
-                    let event = json!({"type":"capabilities", "protocol":1,
+                    let event = json!({"type":"capabilities", "protocol":2,
                         "dictation":true, "sample_rate":16000, "channels":1,
-                        "format":"pcm_s16le", "results":["partial", "final"],
+                        "format":"opus", "results":["partial", "final"],
                         "max_seconds":300, "resume":true,
-                        "audio_encodings":["pcm_s16le", pcm::ENCODING]});
+                        "audio_encodings":[opus::ENCODING], "framing":"sequence_opus_v1", "max_encoded_bytes":opus::MAX_BYTES});
                     let _ = tokio::time::timeout(Duration::from_secs(5), async {
                         ws.send(Message::Text(event.to_string())).await?;
                         ws.close(None).await
@@ -161,85 +169,8 @@ fn serve(listener: TcpListener, token: String) -> mpsc::Receiver<RequestSession>
                     .await;
                     return;
                 }
-                let id = session_id.lock().unwrap().take();
-                let compressed = compression.load(std::sync::atomic::Ordering::Relaxed);
-                if let Some(id) = id {
-                    resumes.connect(id, tx, ws, compressed).await;
-                    return;
-                }
-                let (reply, answer) = oneshot::channel();
-                if tx.try_send(RequestSession { reply }).is_err() {
-                    return;
-                }
-                let admission = match tokio::time::timeout(Duration::from_secs(10), answer).await {
-                    Ok(Ok(Ok(a))) => a,
-                    Ok(Ok(Err(code))) => {
-                        let _ = ws
-                            .send(Message::Text(
-                                json!({"type":"error","code":code}).to_string(),
-                            ))
-                            .await;
-                        return;
-                    }
-                    _ => return,
-                };
-                let Admission { audio, mut events } = admission;
-                // Dropping audio on every return tells the worker to cancel.
-                let deadline = tokio::time::sleep(Duration::from_secs(480));
-                tokio::pin!(deadline);
-                let mut finished = false;
-                let mut pending = None;
-                let started = std::time::Instant::now();
-                let mut received_samples = 0usize;
-                let mut finish_received: Option<std::time::Instant> = None;
-                loop {
-                    tokio::select! {
-                        _ = &mut deadline => break,
-                        event = events.recv() => {
-                            let Some(mut event) = event else { break };
-                            pcm::ready(&mut event, compressed);
-                            let terminal = event["type"] == "final" || event["type"] == "error";
-                            if terminal {
-                                tracing::info!(
-                                    audio_secs = received_samples as f64 / 16000.0,
-                                    elapsed_ms = started.elapsed().as_millis() as u64,
-                                    after_finish_ms = finish_received.map(|t| t.elapsed().as_millis() as u64),
-                                    result = event["type"].as_str().unwrap_or("unknown"),
-                                    "Mobile transport completed"
-                                );
-                            }
-                            if !matches!(tokio::time::timeout(Duration::from_secs(5), ws.send(Message::Text(event.to_string()))).await, Ok(Ok(()))) { break }
-                            if terminal { let _ = ws.close(None).await; break }
-                        }
-                        permit = audio.reserve(), if pending.is_some() => {
-                            let Ok(permit) = permit else { break };
-                            permit.send(pending.take().unwrap());
-                        }
-                        message = ws.next(), if pending.is_none() => match message {
-                            Some(Ok(Message::Binary(bytes))) if !finished => {
-                                let Ok(bytes) = pcm::decode(&bytes, compressed) else { break };
-                                let Ok(samples) = decode_pcm(&bytes) else { break };
-                                received_samples += samples.len();
-                                // Backpressure the socket while continuing to drain result events.
-                                // One pending frame plus the bounded channel; no audio is dropped.
-                                pending = Some(Input::Audio(samples));
-                            }
-                            Some(Ok(Message::Text(text))) if !finished => {
-                                match serde_json::from_str::<Value>(&text).ok().and_then(|v| v["type"].as_str().map(str::to_owned)).as_deref() {
-                                    Some("finish") => {
-                                        finish_received = Some(std::time::Instant::now());
-                                        finished = true;
-                                        pending = Some(Input::Finish);
-                                    },
-                                    _ => break, // includes explicit cancel
-                                }
-                            }
-                            Some(Ok(Message::Ping(p))) => { if ws.send(Message::Pong(p)).await.is_err() { break } },
-                            Some(Ok(Message::Pong(_))) => {},
-                            _ => break,
-                        }
-                    }
-                }
+                let id = session_id.lock().unwrap().take().unwrap();
+                resumes.connect(id, tx, ws).await;
             });
         }
     });
@@ -251,15 +182,6 @@ fn equal_secret(a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     a.iter().zip(b).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0
-}
-fn decode_pcm(bytes: &[u8]) -> Result<Vec<f32>, ()> {
-    if bytes.is_empty() || bytes.len() % 2 != 0 {
-        return Err(());
-    }
-    Ok(bytes
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32 / 32768.0)
-        .collect())
 }
 
 pub fn start(
@@ -274,7 +196,7 @@ pub fn start(
     } else {
         "batch_snapshot"
     };
-    let _ = events.try_send(json!({"type":"ready","protocol":1,"sample_rate":16000,"channels":1,"format":"pcm_s16le","preview":preview,"max_seconds":max_secs}));
+    let _ = events.try_send(json!({"type":"ready","protocol":2,"sample_rate":16000,"channels":1,"format":"opus","audio_encoding":opus::ENCODING,"preview":preview,"max_seconds":max_secs}));
     let out = events.clone();
     let task = tokio::spawn(async move {
         if transcriber.as_streaming().is_some() {
@@ -640,62 +562,6 @@ mod tests {
         assert_eq!(model.cancelled.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
-    async fn websocket_burst_larger_than_both_audio_queues_completes() {
-        use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("ws://{}/v1/dictate", listener.local_addr().unwrap());
-        let mut requests = serve(listener, "burst-test".into());
-        let mut request = url.into_client_request().unwrap();
-        request
-            .headers_mut()
-            .insert("Authorization", "Bearer burst-test".parse().unwrap());
-        let (mut ws, _) = connect_async(request).await.unwrap();
-        let mut model = StreamFake::new(false);
-        model.delay = Duration::from_millis(2);
-        let model = Arc::new(model);
-        let (session, admission) = start(model.clone(), None, 60);
-        assert!(requests
-            .recv()
-            .await
-            .unwrap()
-            .reply
-            .send(Ok(admission))
-            .is_ok());
-        ws.next().await.unwrap().unwrap();
-        for _ in 0..300 {
-            ws.send(Message::Binary(vec![0; 3200])).await.unwrap();
-        }
-        ws.send(Message::Text(r#"{"type":"finish"}"#.into()))
-            .await
-            .unwrap();
-        let text = tokio::time::timeout(Duration::from_secs(5), session.task)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        session
-            .events
-            .send(json!({"type":"final","text":text}))
-            .await
-            .unwrap();
-        loop {
-            let message = tokio::time::timeout(Duration::from_secs(2), ws.next())
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-            let event: Value = serde_json::from_str(&message.into_text().unwrap()).unwrap();
-            if event["type"] == "final" {
-                assert_eq!(event["text"], "hello world");
-                break;
-            }
-        }
-        assert_eq!(model.samples.load(Ordering::SeqCst), 300 * 1600);
-        assert_eq!(model.active.load(Ordering::SeqCst), 0);
-    }
-
     struct Fake {
         calls: AtomicUsize,
         active: AtomicUsize,
@@ -713,23 +579,15 @@ mod tests {
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
     async fn resume_socket(url: &str, id: &str) -> TestSocket {
-        negotiated_socket(url, Some(id), false).await
-    }
-    async fn negotiated_socket(url: &str, id: Option<&str>, compressed: bool) -> TestSocket {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
         let mut request = url.into_client_request().unwrap();
-        request
-            .headers_mut()
-            .insert("Authorization", "Bearer resume-test".parse().unwrap());
-        if let Some(id) = id {
-            request
-                .headers_mut()
-                .insert("X-Voxtype-Session", id.parse().unwrap());
-        }
-        if compressed {
-            request
-                .headers_mut()
-                .insert("X-Voxtype-Audio", pcm::ENCODING.parse().unwrap());
+        for (name, value) in [
+            ("Authorization", "Bearer resume-test"),
+            ("X-Voxtype-Session", id),
+            ("X-Voxtype-Protocol", "2"),
+            ("X-Voxtype-Audio", opus::ENCODING),
+        ] {
+            request.headers_mut().insert(name, value.parse().unwrap());
         }
         tokio_tungstenite::connect_async(request).await.unwrap().0
     }
@@ -741,10 +599,22 @@ mod tests {
             .unwrap();
         serde_json::from_str(&message.into_text().unwrap()).unwrap()
     }
-    async fn send_offset(ws: &mut TestSocket, offset: u64, length: usize) {
-        let mut data = offset.to_be_bytes().to_vec();
-        data.extend(vec![0; length]);
-        ws.send(Message::Binary(data)).await.unwrap();
+    async fn send_frame(
+        ws: &mut TestSocket,
+        sequence: u64,
+        count: usize,
+        last: bool,
+        total: usize,
+    ) {
+        ws.send(Message::Binary(opus::tests::frame(
+            sequence,
+            count,
+            sequence == 0,
+            last,
+            total,
+        )))
+        .await
+        .unwrap();
     }
     async fn resumable_server() -> (String, Arc<StreamFake>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -787,105 +657,18 @@ mod tests {
         }
     }
     #[tokio::test]
-    async fn compressed_pcm_negotiates_without_resumption_and_uses_existing_worker() {
-        let (url, model, supervisor) = resumable_server().await;
-        let mut ws = negotiated_socket(&url, None, true).await;
-        let ready = next_event(&mut ws).await;
-        assert_eq!(ready["audio_encoding"], pcm::ENCODING);
-        assert!(ready.get("resume").is_none());
-        ws.send(Message::Binary(pcm::tests::frame(&vec![0; 3200])))
-            .await
-            .unwrap();
-        ws.send(Message::Text(r#"{"type":"finish"}"#.into()))
-            .await
-            .unwrap();
-        assert_eq!(final_event(&mut ws).await["type"], "final");
-        assert_eq!(model.samples.load(Ordering::SeqCst), 1600);
-        assert_eq!(model.starts.load(Ordering::SeqCst), 1);
-        assert_eq!(model.active.load(Ordering::SeqCst), 0);
-        supervisor.abort();
-    }
-
-    #[tokio::test]
-    async fn compressed_resume_offsets_are_decoded_pcm_and_can_switch_connections() {
-        let (url, model, supervisor) = resumable_server().await;
-        let id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-        let mut raw = resume_socket(&url, id).await;
-        assert!(next_event(&mut raw).await.get("audio_encoding").is_none());
-        send_offset(&mut raw, 0, 1600).await;
-        next_event(&mut raw).await;
-        drop(raw);
-        let mut compressed = negotiated_socket(&url, Some(id), true).await;
-        let ready = next_event(&mut compressed).await;
-        assert_eq!(ready["accepted_bytes"], 1600);
-        assert_eq!(ready["audio_encoding"], pcm::ENCODING);
-        // Checkpoint lies halfway through a retained 3200-byte client frame.
-        let mut frame = 1600u64.to_be_bytes().to_vec();
-        frame.extend(pcm::tests::frame(&vec![0; 1600]));
-        compressed
-            .send(Message::Binary(frame.clone()))
-            .await
-            .unwrap();
-        next_event(&mut compressed).await;
-        compressed.send(Message::Binary(frame)).await.unwrap(); // Decoded duplicate.
-        drop(compressed);
-        let mut raw = resume_socket(&url, id).await;
-        let ready = next_event(&mut raw).await;
-        assert_eq!(ready["accepted_bytes"], 3200);
-        assert!(ready.get("audio_encoding").is_none());
-        send_offset(&mut raw, 3200, 3200).await;
-        raw.send(Message::Text(r#"{"type":"finish"}"#.into()))
-            .await
-            .unwrap();
-        assert_eq!(final_event(&mut raw).await["type"], "final");
-        assert_eq!(model.samples.load(Ordering::SeqCst), 3200);
-        assert_eq!(model.starts.load(Ordering::SeqCst), 1);
-        assert_eq!(model.active.load(Ordering::SeqCst), 0);
-        supervisor.abort();
-    }
-
-    #[tokio::test]
-    async fn corrupted_compressed_audio_never_reaches_model_and_joins_before_reuse() {
-        let (url, model, supervisor) = resumable_server().await;
-        let id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-        let mut ws = negotiated_socket(&url, Some(id), true).await;
-        next_event(&mut ws).await;
-        let mut frame = 0u64.to_be_bytes().to_vec();
-        frame.extend(pcm::tests::frame(&vec![0; 3200]));
-        *frame.last_mut().unwrap() ^= 1;
-        ws.send(Message::Binary(frame)).await.unwrap();
-        assert_eq!(final_event(&mut ws).await["code"], "invalid_audio");
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while model.active.load(Ordering::SeqCst) != 0 {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(model.samples.load(Ordering::SeqCst), 0);
-        assert_eq!(model.cancelled.load(Ordering::SeqCst), 1);
-        let mut next = resume_socket(&url, "cccccccccccccccccccccccccccccccc").await;
-        assert_eq!(next_event(&mut next).await["type"], "ready");
-        next.send(Message::Text(r#"{"type":"finish"}"#.into()))
-            .await
-            .unwrap();
-        assert_eq!(final_event(&mut next).await["type"], "final");
-        assert_eq!(model.starts.load(Ordering::SeqCst), 2);
-        supervisor.abort();
-    }
-    #[tokio::test]
     async fn resume_after_disconnect_continues_same_worker_without_replaying_audio() {
         let (url, model, supervisor) = resumable_server().await;
         let id = "11111111111111111111111111111111";
         let mut ws = resume_socket(&url, id).await;
         assert_eq!(next_event(&mut ws).await["resume"], true);
-        send_offset(&mut ws, 0, 3200).await;
+        send_frame(&mut ws, 0, 5, false, 0).await;
         assert_eq!(next_event(&mut ws).await["type"], "partial");
         drop(ws);
         let mut resumed = resume_socket(&url, id).await;
-        assert_eq!(next_event(&mut resumed).await["accepted_bytes"], 3200);
-        send_offset(&mut resumed, 0, 3200).await; // Duplicate must not reach inference.
-        send_offset(&mut resumed, 3200, 1600).await;
+        assert_eq!(next_event(&mut resumed).await["accepted_frames"], 1);
+        send_frame(&mut resumed, 0, 5, false, 0).await; // Duplicate must not reach inference.
+        send_frame(&mut resumed, 1, 3, true, 2400).await;
         resumed
             .send(Message::Text(r#"{"type":"finish"}"#.into()))
             .await
@@ -902,7 +685,8 @@ mod tests {
         let id = "22222222222222222222222222222222";
         let mut ws = resume_socket(&url, id).await;
         next_event(&mut ws).await;
-        send_offset(&mut ws, 0, 3200).await;
+        send_frame(&mut ws, 0, 5, false, 0).await;
+        send_frame(&mut ws, 1, 0, true, 1600).await;
         ws.send(Message::Text(r#"{"type":"finish"}"#.into()))
             .await
             .unwrap();
@@ -911,7 +695,7 @@ mod tests {
         let mut resumed = resume_socket(&url, id).await;
         let ready = next_event(&mut resumed).await;
         assert_eq!(ready["finished"], true);
-        assert_eq!(ready["accepted_bytes"], 3200);
+        assert_eq!(ready["accepted_frames"], 2);
         assert_eq!(final_event(&mut resumed).await["text"], "hello world");
         assert_eq!(model.starts.load(Ordering::SeqCst), 1);
         resumed
@@ -926,13 +710,13 @@ mod tests {
         let id = "33333333333333333333333333333333";
         let mut old = resume_socket(&url, id).await;
         next_event(&mut old).await;
-        send_offset(&mut old, 0, 3200).await;
+        send_frame(&mut old, 0, 5, false, 0).await;
         next_event(&mut old).await;
         let mut new = resume_socket(&url, id).await;
-        assert_eq!(next_event(&mut new).await["accepted_bytes"], 3200);
+        assert_eq!(next_event(&mut new).await["accepted_frames"], 1);
         let _ = old.send(Message::Text(r#"{"type":"cancel"}"#.into())).await;
         drop(old);
-        send_offset(&mut new, 3200, 3200).await;
+        send_frame(&mut new, 1, 5, true, 3200).await;
         new.send(Message::Text(r#"{"type":"finish"}"#.into()))
             .await
             .unwrap();
@@ -946,8 +730,8 @@ mod tests {
         let (url, model, supervisor) = resumable_server().await;
         let mut ws = resume_socket(&url, "44444444444444444444444444444444").await;
         next_event(&mut ws).await;
-        send_offset(&mut ws, 2, 3200).await;
-        assert_eq!(final_event(&mut ws).await["code"], "invalid_audio_offset");
+        send_frame(&mut ws, 2, 5, false, 0).await;
+        assert_eq!(final_event(&mut ws).await["code"], "invalid_audio_sequence");
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(model.active.load(Ordering::SeqCst), 0);
         assert_eq!(model.samples.load(Ordering::SeqCst), 0);
@@ -959,7 +743,7 @@ mod tests {
         let (url, model, supervisor) = resumable_server().await;
         let mut ws = resume_socket(&url, "55555555555555555555555555555555").await;
         next_event(&mut ws).await;
-        send_offset(&mut ws, 0, 3200).await;
+        send_frame(&mut ws, 0, 5, false, 0).await;
         next_event(&mut ws).await;
         ws.send(Message::Text(r#"{"type":"cancel"}"#.into()))
             .await
@@ -974,6 +758,7 @@ mod tests {
         assert_eq!(model.cancelled.load(Ordering::SeqCst), 1);
         let mut next = resume_socket(&url, "66666666666666666666666666666666").await;
         assert_eq!(next_event(&mut next).await["type"], "ready");
+        send_frame(&mut next, 0, 0, true, 0).await;
         next.send(Message::Text(r#"{"type":"finish"}"#.into()))
             .await
             .unwrap();
@@ -984,12 +769,7 @@ mod tests {
     }
 
     #[test]
-    fn pcm_and_auth() {
-        assert_eq!(
-            decode_pcm(&[0, 128, 255, 127]).unwrap(),
-            vec![-1.0, 32767.0 / 32768.0]
-        );
-        assert!(decode_pcm(&[1]).is_err());
+    fn authentication() {
         assert!(equal_secret(b"secret", b"secret"));
         assert!(!equal_secret(b"secret", b"secreT"));
     }
@@ -1113,69 +893,78 @@ mod tests {
             serde_json::from_str(&ws.next().await.unwrap().unwrap().into_text().unwrap()).unwrap();
         assert_eq!(event["type"], "capabilities");
         assert_eq!(event["dictation"], true);
-        assert_eq!(event["protocol"], 1);
+        assert_eq!(event["protocol"], 2);
         assert_eq!(event["sample_rate"], 16000);
-        assert_eq!(event["format"], "pcm_s16le");
+        assert_eq!(event["format"], "opus");
         assert_eq!(event["results"], json!(["partial", "final"]));
-        assert_eq!(
-            event["audio_encodings"],
-            json!(["pcm_s16le", pcm::ENCODING])
-        );
+        assert_eq!(event["audio_encodings"], json!([opus::ENCODING]));
         assert!(requests.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn websocket_auth_audio_finish_and_disconnect() {
+    async fn legacy_clients_are_rejected_before_model_admission() {
         use tokio_tungstenite::{connect_async, tungstenite::client::IntoClientRequest};
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/v1/dictate", listener.local_addr().unwrap());
         let mut requests = serve(listener, "test-secret".into());
-        assert!(connect_async(&url).await.is_err());
-        assert!(requests.try_recv().is_err());
-        let model = Arc::new(Fake {
-            calls: AtomicUsize::new(0),
-            active: AtomicUsize::new(0),
-        });
-        for finish in [true, false] {
+        for encoding in [None, Some("pcm_s16le"), Some("pcm_s16le_zlib_v1")] {
             let mut request = url.clone().into_client_request().unwrap();
             request
                 .headers_mut()
                 .insert("Authorization", "Bearer test-secret".parse().unwrap());
-            let (mut ws, _) = connect_async(request).await.unwrap();
-            let request = requests.recv().await.unwrap();
-            let (session, admission) = start(model.clone(), None, 5);
-            assert!(request.reply.send(Ok(admission)).is_ok());
-            let ready = ws.next().await.unwrap().unwrap().into_text().unwrap();
-            assert_eq!(
-                serde_json::from_str::<Value>(&ready).unwrap()["type"],
-                "ready"
-            );
-            ws.send(Message::Binary(vec![0; 16000])).await.unwrap();
-            if finish {
-                ws.send(Message::Text(r#"{"type":"finish"}"#.into()))
-                    .await
-                    .unwrap();
-                let text = session.task.await.unwrap().unwrap().unwrap();
-                session
-                    .events
-                    .send(json!({"type":"final","text":text}))
-                    .await
-                    .unwrap();
-                let final_event = ws.next().await.unwrap().unwrap().into_text().unwrap();
-                assert_eq!(
-                    serde_json::from_str::<Value>(&final_event).unwrap()["text"],
-                    "hello"
-                );
-            } else {
-                ws.close(None).await.unwrap();
-                assert!(tokio::time::timeout(Duration::from_secs(2), session.task)
-                    .await
-                    .unwrap()
-                    .unwrap()
-                    .unwrap()
-                    .is_none());
+            if let Some(value) = encoding {
+                request
+                    .headers_mut()
+                    .insert("X-Voxtype-Audio", value.parse().unwrap());
             }
+            let error = connect_async(request).await.unwrap_err();
+            assert!(
+                matches!(error,tokio_tungstenite::tungstenite::Error::Http(response) if response.status()==426)
+            );
         }
-        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        assert!(requests.try_recv().is_err());
+    }
+    #[tokio::test]
+    async fn opus_burst_larger_than_all_audio_queues_finishes_without_loss() {
+        let (url, model, supervisor) = resumable_server().await;
+        let mut ws = resume_socket(&url, "77777777777777777777777777777777").await;
+        next_event(&mut ws).await;
+        for sequence in 0..300 {
+            send_frame(&mut ws, sequence, 5, false, 0).await;
+        }
+        send_frame(&mut ws, 300, 0, true, 300 * 1600).await;
+        ws.send(Message::Text(r#"{"type":"finish"}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(final_event(&mut ws).await["type"], "final");
+        assert_eq!(model.samples.load(Ordering::SeqCst), 300 * 1600);
+        assert_eq!(model.starts.load(Ordering::SeqCst), 1);
+        supervisor.abort();
+    }
+    #[tokio::test]
+    async fn malformed_opus_cancels_worker_and_new_session_replays_from_start() {
+        let (url, model, supervisor) = resumable_server().await;
+        let mut ws = resume_socket(&url, "88888888888888888888888888888888").await;
+        next_event(&mut ws).await;
+        ws.send(Message::Binary(vec![0; 16])).await.unwrap();
+        assert_eq!(final_event(&mut ws).await["code"], "invalid_audio");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while model.active.load(Ordering::SeqCst) != 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(model.samples.load(Ordering::SeqCst), 0);
+        let mut next = resume_socket(&url, "99999999999999999999999999999999").await;
+        assert_eq!(next_event(&mut next).await["accepted_frames"], 0);
+        send_frame(&mut next, 0, 1, true, 1).await;
+        next.send(Message::Text(r#"{"type":"finish"}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(final_event(&mut next).await["type"], "final");
+        assert_eq!(model.samples.load(Ordering::SeqCst), 1);
+        assert_eq!(model.starts.load(Ordering::SeqCst), 2);
+        supervisor.abort();
     }
 }

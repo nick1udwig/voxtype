@@ -1,4 +1,4 @@
-//! Bounded, opt-in session resumption. The admission still comes from Daemon;
+//! Bounded, mandatory session resumption. The admission still comes from Daemon;
 //! this transport retains audio/state, never a model or an inference factory.
 use super::*;
 use std::collections::{HashMap, VecDeque};
@@ -23,13 +23,13 @@ struct Snapshot {
     terminal: bool,
 }
 impl Snapshot {
-    fn ready_event(&self, compressed: bool) -> Value {
+    fn ready_event(&self) -> Value {
         let mut ready = self.ready.clone();
         ready["resume"] = json!(true);
-        ready["accepted_bytes"] = json!(self.accepted);
+        ready["accepted_frames"] = json!(self.accepted);
         ready["finished"] = json!(self.finished);
-        ready["framing"] = json!("offset_pcm_s16le");
-        pcm::ready(&mut ready, compressed);
+        ready["framing"] = json!("sequence_opus_v1");
+        ready["max_encoded_bytes"] = json!(opus::MAX_BYTES);
         ready
     }
     fn event(&mut self, event: Value) {
@@ -41,15 +41,10 @@ impl Snapshot {
 
 enum Command {
     Attach(oneshot::Sender<Snapshot>),
-    Audio {
-        epoch: u64,
-        offset: usize,
-        bytes: Vec<u8>,
-    },
+    Audio { epoch: u64, bytes: Vec<u8> },
     Finish(u64),
     Detach(u64),
     Cancel(u64),
-    InvalidAudio(u64),
     // A new dictation can discard an unfinished, disconnected predecessor.
     Abandon,
     Ack(u64),
@@ -94,6 +89,7 @@ impl Registry {
                 return Err("busy");
             }
         }
+        let decoder = opus::Decoder::new()?;
         let (reply, answer) = oneshot::channel();
         requests
             .try_send(RequestSession { reply })
@@ -109,7 +105,7 @@ impl Registry {
         if ready["type"] != "ready" {
             return Err("model_unavailable");
         }
-        let entry = spawn(admission, ready);
+        let entry = spawn(admission, ready, decoder);
         entries.insert(id.to_owned(), entry.clone());
         Ok(entry)
     }
@@ -119,7 +115,6 @@ impl Registry {
         id: String,
         requests: mpsc::Sender<RequestSession>,
         mut ws: WebSocketStream<tokio::net::TcpStream>,
-        compressed: bool,
     ) {
         let entry = match self.get(&id, &requests).await {
             Ok(e) => e,
@@ -138,7 +133,7 @@ impl Registry {
         let epoch = snapshot.epoch;
         let mut updates = entry.state.clone();
         async {
-            if !send(&mut ws, &snapshot.ready_event(compressed)).await { return; }
+            if !send(&mut ws, &snapshot.ready_event()).await { return; }
             let mut revision = 0;
             let mut pending = None;
             loop {
@@ -160,15 +155,9 @@ impl Registry {
                     }
                     message = ws.next(), if pending.is_none() => match message {
                         Some(Ok(Message::Binary(bytes))) => {
-                            if bytes.len() < 8 { pending = Some(Command::InvalidAudio(epoch)); }
-                            else {
-                                let raw = u64::from_be_bytes(bytes[..8].try_into().unwrap());
-                                match (usize::try_from(raw), pcm::decode(&bytes[8..], compressed)) {
-                                    (Ok(offset), Ok(pcm)) if !pcm.is_empty() && pcm.len() % 2 == 0 =>
-                                        pending = Some(Command::Audio { epoch, offset, bytes: pcm.into_owned() }),
-                                    _ => pending = Some(Command::InvalidAudio(epoch)),
-                                }
-                            }
+                            // Parsing and native decoder mutation belong to the session
+                            // actor, after socket epoch and frame checkpoint validation.
+                            pending = Some(Command::Audio { epoch, bytes });
                         }
                         Some(Ok(Message::Text(text))) => {
                             let kind = serde_json::from_str::<Value>(&text).ok()
@@ -204,7 +193,7 @@ async fn send(ws: &mut WebSocketStream<tokio::net::TcpStream>, event: &Value) ->
     )
 }
 
-fn spawn(admission: Admission, ready: Value) -> Arc<Entry> {
+fn spawn(admission: Admission, ready: Value, mut decoder: opus::Decoder) -> Arc<Entry> {
     let snapshot = Snapshot {
         ready,
         accepted: 0,
@@ -228,11 +217,12 @@ fn spawn(admission: Admission, ready: Value) -> Arc<Entry> {
         let mut finish_received: Option<Instant> = None;
         let mut expiry = Instant::now() + RECONNECT_GRACE;
         let mut terminal_expiry = None;
-        let max_bytes = snapshot.ready["max_seconds"]
+        let mut encoded_bytes = 0usize;
+        let max_samples = snapshot.ready["max_seconds"]
             .as_u64()
             .unwrap_or(300)
             .min(300) as usize
-            * 32000;
+            * 16000;
         loop {
             let deadline = terminal_expiry.unwrap_or(if snapshot.attached || snapshot.finished {
                 hard_deadline
@@ -253,7 +243,7 @@ fn spawn(admission: Admission, ready: Value) -> Arc<Entry> {
                         Command::Attach(reply) => {
                             snapshot.epoch += 1;
                             snapshot.attached = true;
-                            tracing::info!(resumed = snapshot.epoch > 1, accepted_bytes = snapshot.accepted,
+                            tracing::info!(resumed = snapshot.epoch > 1, accepted_frames = snapshot.accepted,
                                 finished = snapshot.finished, "Mobile session attached");
                             updates.send_replace(snapshot.clone());
                             let _ = reply.send(snapshot.clone());
@@ -263,35 +253,39 @@ fn spawn(admission: Admission, ready: Value) -> Arc<Entry> {
                             expiry = Instant::now() + if snapshot.accepted == 0 { Duration::from_secs(2) } else { RECONNECT_GRACE };
                             updates.send_replace(snapshot.clone());
                         }
-                        Command::Audio { epoch, offset, bytes } if epoch == snapshot.epoch && !snapshot.terminal => {
-                            let end = offset.checked_add(bytes.len());
-                            if end.is_some_and(|end| end <= snapshot.accepted) && offset % 2 == 0
-                                && !bytes.is_empty() && bytes.len() % 2 == 0 {
-                                continue; // An already accepted frame is a harmless duplicate.
-                            }
-                            if offset != snapshot.accepted || snapshot.finished || bytes.is_empty() || bytes.len() % 2 != 0
-                                || end.is_none_or(|end| end > max_bytes) {
-                                snapshot.event(json!({"type":"error","code":"invalid_audio_offset"}));
-                            } else {
-                                // Aggregate tiny frames so a bounded audio duration also bounds
-                                // allocation overhead. At most 3000 100-ms chunks / 19.2 MB PCM.
-                                for sample in decode_pcm(&bytes).unwrap() {
-                                    if queue.back().is_none_or(|b| b.len() == 1600) { queue.push_back(Vec::with_capacity(1600)); }
-                                    queue.back_mut().unwrap().push(sample);
+                        Command::Audio { epoch, bytes } if epoch == snapshot.epoch && !snapshot.terminal => {
+                            // A duplicate must never touch the stateful native decoder.
+                            match opus::Frame::parse(&bytes) {
+                                Ok(frame) if frame.sequence < snapshot.accepted => continue,
+                                Ok(frame) if frame.sequence == snapshot.accepted && !snapshot.finished
+                                    && encoded_bytes + bytes.len() <= opus::MAX_BYTES => {
+                                    match decoder.decode(&frame, max_samples) {
+                                        Ok(samples) => {
+                                            for sample in samples {
+                                                if queue.back().is_none_or(|b| b.len() == 1600) { queue.push_back(Vec::with_capacity(1600)); }
+                                                queue.back_mut().unwrap().push(sample);
+                                            }
+                                            encoded_bytes += bytes.len();
+                                            snapshot.accepted += 1;
+                                        }
+                                        Err(_) => snapshot.event(json!({"type":"error","code":"invalid_audio"})),
+                                    }
                                 }
-                                snapshot.accepted = end.unwrap();
+                                Ok(_) => snapshot.event(json!({"type":"error","code":"invalid_audio_sequence"})),
+                                Err(_) => snapshot.event(json!({"type":"error","code":"invalid_audio"})),
                             }
                         }
                         Command::Finish(epoch) if epoch == snapshot.epoch && !snapshot.terminal => {
-                            snapshot.finished = true;
-                            if finish_received.is_none() { finish_received = Some(Instant::now()); }
+                            if !decoder.finished {
+                                snapshot.event(json!({"type":"error","code":"incomplete_audio"}));
+                            } else {
+                                snapshot.finished = true;
+                                if finish_received.is_none() { finish_received = Some(Instant::now()); }
+                            }
                         }
                         Command::Cancel(epoch) if epoch == snapshot.epoch => {
                             snapshot.event(json!({"type":"error","code":"cancelled"}));
                             terminal_expiry = Some(Instant::now());
-                        }
-                        Command::InvalidAudio(epoch) if epoch == snapshot.epoch && !snapshot.terminal => {
-                            snapshot.event(json!({"type":"error","code":"invalid_audio"}));
                         }
                         Command::Abandon if !snapshot.attached && !snapshot.finished && !snapshot.terminal => {
                             snapshot.event(json!({"type":"error","code":"cancelled"}));
@@ -320,7 +314,7 @@ fn spawn(admission: Admission, ready: Value) -> Arc<Entry> {
                 queue.clear();
                 if terminal_expiry.is_none() {
                     tracing::info!(
-                        audio_secs = snapshot.accepted as f64 / 32000.0,
+                        audio_secs = decoder.delivered as f64 / 16000.0,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         after_finish_ms = finish_received.map(|t| t.elapsed().as_millis() as u64),
                         "Mobile resumable session completed"
@@ -351,19 +345,40 @@ mod tests {
     fn stub() -> (Arc<Entry>, mpsc::Receiver<Input>, mpsc::Sender<Value>) {
         let (audio, input) = mpsc::channel(1);
         let (out, events) = mpsc::channel(8);
-        let entry = spawn(
-            Admission { audio, events },
-            json!({"type":"ready","max_seconds":1}),
-        );
-        (entry, input, out)
+        (
+            spawn(
+                Admission { audio, events },
+                json!({"type":"ready","max_seconds":1}),
+                opus::Decoder::new().unwrap(),
+            ),
+            input,
+            out,
+        )
     }
     async fn attach(entry: &Entry) -> Snapshot {
         let (tx, rx) = oneshot::channel();
         entry.commands.send(Command::Attach(tx)).await.unwrap();
         rx.await.unwrap()
     }
+    async fn audio(
+        entry: &Entry,
+        epoch: u64,
+        sequence: u64,
+        count: usize,
+        last: bool,
+        total: usize,
+    ) {
+        entry
+            .commands
+            .send(Command::Audio {
+                epoch,
+                bytes: opus::tests::frame(sequence, count, sequence == 0, last, total),
+            })
+            .await
+            .unwrap();
+    }
     #[tokio::test(start_paused = true)]
-    async fn disconnected_session_expires_and_erases_retained_result() {
+    async fn disconnected_session_expires_and_erases_cached_error() {
         let (entry, mut input, _events) = stub();
         let first = attach(&entry).await;
         entry
@@ -382,9 +397,10 @@ mod tests {
         assert!(entry.state.borrow().event.is_none());
     }
     #[tokio::test(start_paused = true)]
-    async fn finished_session_can_complete_offline_and_ack_erases_cache() {
+    async fn completed_offline_session_replays_result_and_ack_erases_cache() {
         let (entry, mut input, events) = stub();
         let first = attach(&entry).await;
+        audio(&entry, first.epoch, 0, 0, true, 0).await;
         entry
             .commands
             .send(Command::Finish(first.epoch))
@@ -417,66 +433,145 @@ mod tests {
         assert!(entry.commands.is_closed());
         assert!(entry.state.borrow().event.is_none());
     }
-    #[tokio::test(start_paused = true)]
-    async fn audio_limit_and_stale_lease_are_enforced() {
-        let (entry, _input, _events) = stub();
+    #[tokio::test]
+    async fn stale_socket_and_duplicate_cannot_mutate_decoder_or_checkpoint() {
+        let (entry, mut input, _events) = stub();
         let old = attach(&entry).await;
+        audio(&entry, old.epoch, 0, 5, false, 0).await;
         let current = attach(&entry).await;
+        assert_eq!(current.accepted, 1);
+        assert!(matches!(input.recv().await,Some(Input::Audio(pcm)) if pcm.len()==1280));
+        audio(&entry, old.epoch, 1, 5, false, 0).await;
         entry
             .commands
             .send(Command::Cancel(old.epoch))
             .await
             .unwrap();
+        audio(&entry, current.epoch, 0, 5, false, 0).await;
+        audio(&entry, current.epoch, 1, 0, true, 1500).await;
         entry
             .commands
-            .send(Command::Detach(old.epoch))
+            .send(Command::Finish(current.epoch))
             .await
             .unwrap();
-        let unchanged = attach(&entry).await;
-        assert!(unchanged.attached && !unchanged.terminal);
-        assert!(unchanged.epoch > current.epoch);
+        assert!(matches!(input.recv().await,Some(Input::Audio(pcm)) if pcm.len()==220));
+        assert!(matches!(input.recv().await, Some(Input::Finish)));
+        assert_eq!(attach(&entry).await.accepted, 2);
+    }
+    #[tokio::test]
+    async fn finish_requires_eos_and_duration_limit_is_enforced() {
+        let (entry, _input, _events) = stub();
+        let state = attach(&entry).await;
+        entry
+            .commands
+            .send(Command::Finish(state.epoch))
+            .await
+            .unwrap();
+        let state = attach(&entry).await;
+        assert_eq!(state.event.unwrap()["code"], "incomplete_audio");
+        let (entry, _input, _events) = stub();
+        let state = attach(&entry).await;
+        audio(&entry, state.epoch, 0, 1, true, 16001).await;
+        let state = attach(&entry).await;
+        assert!(state.terminal);
+        assert_eq!(state.accepted, 0);
+    }
+    #[tokio::test]
+    async fn malformed_later_packet_does_not_admit_partial_frame() {
+        let (entry, mut input, _events) = stub();
+        let state = attach(&entry).await;
+        let mut bytes = opus::tests::frame(0, 2, true, true, 640);
+        bytes[24] = 0xff;
         entry
             .commands
             .send(Command::Audio {
-                epoch: unchanged.epoch,
-                offset: 0,
-                bytes: vec![0; 32002],
+                epoch: state.epoch,
+                bytes,
             })
             .await
             .unwrap();
-        tokio::task::yield_now().await;
-        assert!(entry.state.borrow().terminal);
-        assert_eq!(entry.state.borrow().accepted, 0);
+        let state = attach(&entry).await;
+        assert!(state.terminal);
+        assert_eq!(state.accepted, 0);
+        assert!(input.recv().await.is_none());
     }
-    #[tokio::test(start_paused = true)]
-    async fn duplicate_frames_do_not_advance_checkpoint_twice() {
+    #[tokio::test]
+    async fn bounded_spool_backpressure_still_consumes_cancellation() {
         let (entry, _input, _events) = stub();
-        let first = attach(&entry).await;
-        for _ in 0..2 {
-            entry
-                .commands
-                .send(Command::Audio {
-                    epoch: first.epoch,
-                    offset: 0,
-                    bytes: vec![0; 3200],
-                })
-                .await
-                .unwrap();
+        let state = attach(&entry).await;
+        for sequence in 0..10 {
+            audio(&entry, state.epoch, sequence, 5, false, 0).await;
         }
-        let checkpoint = attach(&entry).await;
-        assert_eq!(checkpoint.accepted, 3200);
-        assert!(!checkpoint.terminal);
+        entry
+            .commands
+            .send(Command::Cancel(state.epoch))
+            .await
+            .unwrap();
+        let state = attach(&entry).await;
+        assert!(state.terminal);
     }
-    #[test]
-    fn ids_are_bounded_and_header_safe() {
-        assert!(valid_id("0123456789abcdef0123456789abcdef"));
-        for id in [
-            "",
-            "bad\r\nheader",
-            "0123456789abcdef0123456789abcdef00",
-            "0123456789abcdef0123456789abcdeg",
-        ] {
-            assert!(!valid_id(id));
+    #[tokio::test]
+    async fn real_opus_decoder_continuity_survives_reconnect_duplicates_and_stale_frames() {
+        let golden = opus::tests::golden();
+        let mut decoder = opus::Decoder::new().unwrap();
+        let mut expected = Vec::new();
+        for bytes in &golden {
+            expected.extend(
+                decoder
+                    .decode(&opus::Frame::parse(bytes).unwrap(), 16000)
+                    .unwrap(),
+            );
         }
+        let (entry, mut input, _events) = stub();
+        let old = attach(&entry).await;
+        entry
+            .commands
+            .send(Command::Audio {
+                epoch: old.epoch,
+                bytes: golden[0].clone(),
+            })
+            .await
+            .unwrap();
+        let current = attach(&entry).await;
+        assert_eq!(current.accepted, 1);
+        entry
+            .commands
+            .send(Command::Audio {
+                epoch: old.epoch,
+                bytes: golden[1].clone(),
+            })
+            .await
+            .unwrap();
+        let mut duplicate = golden[0].clone();
+        duplicate[19] = 0xff; // would corrupt native state if decoded
+        entry
+            .commands
+            .send(Command::Audio {
+                epoch: current.epoch,
+                bytes: duplicate,
+            })
+            .await
+            .unwrap();
+        entry
+            .commands
+            .send(Command::Audio {
+                epoch: current.epoch,
+                bytes: golden[1].clone(),
+            })
+            .await
+            .unwrap();
+        entry
+            .commands
+            .send(Command::Finish(current.epoch))
+            .await
+            .unwrap();
+        let mut actual = Vec::new();
+        while let Some(input) = input.recv().await {
+            match input {
+                Input::Audio(pcm) => actual.extend(pcm),
+                Input::Finish => break,
+            }
+        }
+        assert_eq!(actual, expected);
     }
 }
