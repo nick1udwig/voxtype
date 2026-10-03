@@ -23,12 +23,13 @@ struct Snapshot {
     terminal: bool,
 }
 impl Snapshot {
-    fn ready_event(&self) -> Value {
+    fn ready_event(&self, compressed: bool) -> Value {
         let mut ready = self.ready.clone();
         ready["resume"] = json!(true);
         ready["accepted_bytes"] = json!(self.accepted);
         ready["finished"] = json!(self.finished);
         ready["framing"] = json!("offset_pcm_s16le");
+        pcm::ready(&mut ready, compressed);
         ready
     }
     fn event(&mut self, event: Value) {
@@ -48,6 +49,7 @@ enum Command {
     Finish(u64),
     Detach(u64),
     Cancel(u64),
+    InvalidAudio(u64),
     // A new dictation can discard an unfinished, disconnected predecessor.
     Abandon,
     Ack(u64),
@@ -117,6 +119,7 @@ impl Registry {
         id: String,
         requests: mpsc::Sender<RequestSession>,
         mut ws: WebSocketStream<tokio::net::TcpStream>,
+        compressed: bool,
     ) {
         let entry = match self.get(&id, &requests).await {
             Ok(e) => e,
@@ -135,7 +138,7 @@ impl Registry {
         let epoch = snapshot.epoch;
         let mut updates = entry.state.clone();
         async {
-            if !send(&mut ws, &snapshot.ready_event()).await { return; }
+            if !send(&mut ws, &snapshot.ready_event(compressed)).await { return; }
             let mut revision = 0;
             let mut pending = None;
             loop {
@@ -157,12 +160,13 @@ impl Registry {
                     }
                     message = ws.next(), if pending.is_none() => match message {
                         Some(Ok(Message::Binary(bytes))) => {
-                            if bytes.len() < 10 || (bytes.len() - 8) % 2 != 0 { pending = Some(Command::Cancel(epoch)); }
+                            if bytes.len() < 8 { pending = Some(Command::InvalidAudio(epoch)); }
                             else {
                                 let raw = u64::from_be_bytes(bytes[..8].try_into().unwrap());
-                                match usize::try_from(raw) {
-                                    Ok(offset) => pending = Some(Command::Audio { epoch, offset, bytes: bytes[8..].to_vec() }),
-                                    Err(_) => pending = Some(Command::Cancel(epoch)),
+                                match (usize::try_from(raw), pcm::decode(&bytes[8..], compressed)) {
+                                    (Ok(offset), Ok(pcm)) if !pcm.is_empty() && pcm.len() % 2 == 0 =>
+                                        pending = Some(Command::Audio { epoch, offset, bytes: pcm.into_owned() }),
+                                    _ => pending = Some(Command::InvalidAudio(epoch)),
                                 }
                             }
                         }
@@ -285,6 +289,9 @@ fn spawn(admission: Admission, ready: Value) -> Arc<Entry> {
                         Command::Cancel(epoch) if epoch == snapshot.epoch => {
                             snapshot.event(json!({"type":"error","code":"cancelled"}));
                             terminal_expiry = Some(Instant::now());
+                        }
+                        Command::InvalidAudio(epoch) if epoch == snapshot.epoch && !snapshot.terminal => {
+                            snapshot.event(json!({"type":"error","code":"invalid_audio"}));
                         }
                         Command::Abandon if !snapshot.attached && !snapshot.finished && !snapshot.terminal => {
                             snapshot.event(json!({"type":"error","code":"cancelled"}));

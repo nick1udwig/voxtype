@@ -28,7 +28,8 @@ Only four authenticated/handshaking connections may be outstanding.
    Batch models advertise `"preview":"batch_snapshot"`. Existing Android clients support both.
 2. Client: binary frames of signed 16-bit little-endian, mono, 16 kHz PCM.
    The Android client captures immediately on button-down and retains at most
-   300 seconds of audio until completion or discard; it sends 100 ms frames. No WAV header or encoding negotiation.
+   300 seconds of audio until completion or discard; it sends 100 ms frames. No WAV header.
+   Raw PCM remains the default; optional lossless framing is described below.
 3. Server: `{"type":"partial","text":"cumulative revisable text"}`.
    Every partial replaces the whole preview. It is never inserted into the app.
 4. Client: `{"type":"finish"}` after the last audio frame.
@@ -46,6 +47,44 @@ Frames are limited to 64 KiB; queues and audio duration are bounded (at most
 300 seconds). Server holds admission until all inference has returned, even on
 cancellation. Inference cannot be forcibly interrupted safely; a hung backend
 keeps the daemon busy until its service is restarted.
+
+## Optional lossless PCM transport
+
+Send `X-Voxtype-Audio: pcm_s16le_zlib_v1` in the authenticated WebSocket handshake.
+Only use the encoded framing when the ready event acknowledges
+`"audio_encoding":"pcm_s16le_zlib_v1"`. Without this field (including older
+servers), send the existing raw PCM framing. Clients without the header retain
+the existing protocol. Discovery advertises supported `audio_encodings`;
+negotiation is per connection and must be checked again after every reconnect.
+
+Each negotiated binary message contains this envelope, after the existing
+8-byte offset if session resumption is enabled:
+
+| Bytes | Meaning |
+| --- | --- |
+| 1 | Codec: `0` for raw PCM, `1` for one independent zlib stream |
+| 4 | Unsigned big-endian decoded PCM byte length |
+| Remaining | Exact raw PCM bytes or complete RFC 1950 zlib stream |
+
+Both codecs decode to the same signed 16-bit little-endian, mono, 16 kHz samples.
+The Android encoder uses zlib level 1 and falls back to codec 0 when compression
+does not shorten that frame. There is no shared dictionary or stream across
+messages. The decoded length must be nonzero, even and at most 65,522 bytes, so a
+raw fallback plus envelope and offset fits the existing 65,536-byte message cap.
+The server caps inflation before allocation and rejects invalid checksums,
+truncated streams, trailing data, concatenated streams and decoded-length
+mismatches. It does not construct a model; decoded PCM enters the existing
+bounded session and inference paths.
+
+Offsets, `accepted_bytes` and recording-duration limits always count **decoded
+PCM bytes**, never envelope or compressed bytes. A checkpoint inside a retained
+client frame is handled by encoding its remaining PCM suffix as a fresh frame.
+The same session may reconnect with compression enabled or disabled; either
+connection continues at the canonical decoded-byte checkpoint.
+
+The fixed cross-language test vector encodes eight repetitions of the PCM bytes
+`00 80 ff 7f 00 00 01 00`. Its envelope and zlib stream are hexadecimal
+`010000004078016368f85fcfc0c0c8c040260d001f360ff9`.
 
 ## Optional session resumption
 
@@ -148,7 +187,7 @@ Backend integrations can open `ws://127.0.0.1:8765/v1/capabilities` with the sam
 Authorization header and no Origin. The daemon sends one JSON event and closes:
 
 ```json
-{"type":"capabilities","protocol":1,"dictation":true,"sample_rate":16000,"channels":1,"format":"pcm_s16le","results":["partial","final"],"max_seconds":300,"resume":true}
+{"type":"capabilities","protocol":1,"dictation":true,"sample_rate":16000,"channels":1,"format":"pcm_s16le","results":["partial","final"],"max_seconds":300,"resume":true,"audio_encodings":["pcm_s16le","pcm_s16le_zlib_v1"]}
 ```
 
 Discovery does not request admission, load a model or interrupt active dictation.
