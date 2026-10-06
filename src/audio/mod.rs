@@ -33,6 +33,12 @@ pub trait AudioCapture: Send + Sync {
     /// This drains the internal buffer and returns samples collected since the last call.
     /// Returns an empty Vec if not yet started or already stopped.
     async fn get_samples(&mut self) -> Vec<f32>;
+
+    /// Streaming cannot recover samples omitted by a full callback queue.
+    /// Batch capture can still use its separately retained recording.
+    fn streaming_error(&self) -> Option<AudioError> {
+        None
+    }
 }
 
 /// Factory function to create audio capture

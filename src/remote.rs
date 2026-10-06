@@ -38,6 +38,90 @@ pub struct Session {
     // Never abort this task: a blocking inference must finish before admission
     // is reopened, including when the phone disconnects.
     pub task: JoinHandle<Result<Option<String>, String>>,
+    cancel: oneshot::Sender<()>,
+}
+
+pub const MAX_SHARED_STREAMS: usize = 2;
+pub type SessionResult = Result<Result<Option<String>, String>, tokio::task::JoinError>;
+
+#[derive(Clone, Copy)]
+pub enum DesktopActivity {
+    Idle,
+    Streaming,
+    Exclusive,
+}
+
+/// Admission slots stay occupied until the recognition task has joined its
+/// backend worker. Each stream owns its audio, events and cancellation state.
+pub struct Sessions {
+    active: Vec<Session>,
+    shared_streaming: bool,
+}
+
+impl Sessions {
+    pub fn new(shared_streaming: bool) -> Self {
+        Self {
+            active: Vec::new(),
+            shared_streaming,
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.active.is_empty()
+    }
+
+    pub fn can_admit(&self, desktop: DesktopActivity) -> bool {
+        match (self.shared_streaming, desktop) {
+            (_, DesktopActivity::Exclusive) | (false, DesktopActivity::Streaming) => false,
+            (false, DesktopActivity::Idle) => self.is_empty(),
+            (true, DesktopActivity::Idle) => self.active.len() < MAX_SHARED_STREAMS,
+            (true, DesktopActivity::Streaming) => self.active.len() < MAX_SHARED_STREAMS - 1,
+        }
+    }
+
+    pub fn can_start_desktop(&self) -> bool {
+        self.is_empty() || (self.shared_streaming && self.active.len() < MAX_SHARED_STREAMS)
+    }
+
+    pub fn insert(&mut self, session: Session) {
+        assert!(
+            self.active.len()
+                < if self.shared_streaming {
+                    MAX_SHARED_STREAMS
+                } else {
+                    1
+                }
+        );
+        self.active.push(session);
+    }
+
+    pub async fn next_completed(&mut self) -> (mpsc::Sender<Value>, SessionResult) {
+        use std::{future::Future, pin::Pin, task::Poll};
+        std::future::poll_fn(|cx| {
+            for (index, session) in self.active.iter_mut().enumerate() {
+                if let Poll::Ready(result) = Pin::new(&mut session.task).poll(cx) {
+                    let session = self.active.swap_remove(index);
+                    return Poll::Ready((session.events, result));
+                }
+            }
+            Poll::Pending
+        })
+        .await
+    }
+
+    pub async fn shutdown(&mut self) {
+        let tasks: Vec<_> = self
+            .active
+            .drain(..)
+            .map(|session| {
+                let _ = session.cancel.send(());
+                session.task
+            })
+            .collect();
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
 }
 
 pub async fn listen() -> std::io::Result<Option<mpsc::Receiver<RequestSession>>> {
@@ -198,15 +282,20 @@ pub fn start(
     };
     let _ = events.try_send(json!({"type":"ready","protocol":2,"sample_rate":16000,"channels":1,"format":"opus","audio_encoding":opus::ENCODING,"preview":preview,"max_seconds":max_secs}));
     let out = events.clone();
+    let (cancel, cancel_rx) = oneshot::channel();
     let task = tokio::spawn(async move {
         if transcriber.as_streaming().is_some() {
-            recognize_streaming(transcriber, rx, out, max_secs).await
+            recognize_streaming(transcriber, rx, out, max_secs, cancel_rx).await
         } else {
-            recognize(transcriber, vad, rx, out, max_secs).await
+            recognize(transcriber, vad, rx, out, max_secs, cancel_rx).await
         }
     });
     (
-        Session { events, task },
+        Session {
+            events,
+            task,
+            cancel,
+        },
         Admission {
             audio,
             events: event_rx,
@@ -219,6 +308,7 @@ async fn recognize_streaming(
     mut input: mpsc::Receiver<Input>,
     events: mpsc::Sender<Value>,
     max_secs: u32,
+    mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<Option<String>, String> {
     let (audio_tx, audio_rx) = mpsc::channel(64);
     let handle = transcriber
@@ -245,6 +335,7 @@ async fn recognize_streaming(
     let outcome = loop {
         tokio::select! {
             biased;
+            _ = &mut cancel_rx => break Ok(None),
             _ = events.closed() => break Ok(None),
             _ = &mut deadline => break Err("recording_timeout".to_string()),
             permit = async { audio.as_ref().unwrap().clone().reserve_owned().await }, if pending.is_some() => {
@@ -328,6 +419,7 @@ async fn recognize(
     mut input: mpsc::Receiver<Input>,
     events: mpsc::Sender<Value>,
     max_secs: u32,
+    mut cancel_rx: oneshot::Receiver<()>,
 ) -> Result<Option<String>, String> {
     let mut samples = Vec::new();
     let mut preview: Option<JoinHandle<Result<String, String>>> = None;
@@ -337,6 +429,8 @@ async fn recognize(
     tokio::pin!(deadline);
     let finish = loop {
         tokio::select! {
+            _ = &mut cancel_rx => break Ok(false),
+            _ = events.closed() => break Ok(false),
             _ = &mut deadline => break Err("recording_timeout"),
             chunk = input.recv() => match chunk {
                 Some(Input::Audio(audio)) => {
@@ -368,7 +462,12 @@ async fn recognize(
         Err(code) => Err(code.into()),
         // A cancel/disconnect can close events while we join the preview after
         // Finish. Do not start another inference for an abandoned recording.
-        Ok(true) if events.is_closed() => Ok(None),
+        Ok(true)
+            if events.is_closed()
+                || cancel_rx.try_recv() != Err(oneshot::error::TryRecvError::Empty) =>
+        {
+            Ok(None)
+        }
         Ok(true) if samples.len() < 4800 => Ok(Some(String::new())),
         Ok(true) => {
             if let Some(vad) = vad {
@@ -376,7 +475,14 @@ async fn recognize(
                     return Ok(Some(String::new()));
                 }
             }
-            infer(t, samples).await.map(Some)
+            let result = infer(t, samples).await;
+            if events.is_closed()
+                || cancel_rx.try_recv() != Err(oneshot::error::TryRecvError::Empty)
+            {
+                Ok(None)
+            } else {
+                result.map(Some)
+            }
         }
     }
 }
@@ -393,6 +499,7 @@ mod tests {
         fail_flush: bool,
         samples: Arc<AtomicUsize>,
         delay: Duration,
+        count_results: bool,
     }
     impl StreamFake {
         fn new(fail_flush: bool) -> Self {
@@ -403,6 +510,7 @@ mod tests {
                 fail_flush,
                 samples: Arc::new(AtomicUsize::new(0)),
                 delay: Duration::ZERO,
+                count_results: false,
             }
         }
     }
@@ -419,16 +527,18 @@ mod tests {
             &self,
             mut samples: mpsc::Receiver<Vec<f32>>,
         ) -> Result<StreamHandle, crate::error::TranscribeError> {
-            assert_eq!(self.active.fetch_add(1, Ordering::SeqCst), 0);
+            assert!(self.active.fetch_add(1, Ordering::SeqCst) < MAX_SHARED_STREAMS);
             self.starts.fetch_add(1, Ordering::SeqCst);
             let active = self.active.clone();
             let cancelled = self.cancelled.clone();
             let fail_flush = self.fail_flush;
             let received = self.samples.clone();
             let delay = self.delay;
+            let count_results = self.count_results;
             let (tx, events) = mpsc::channel(16);
             let (cancel, mut cancel_rx) = oneshot::channel();
             let task = tokio::spawn(async move {
+                let mut count = 0;
                 loop {
                     tokio::select! {
                         biased;
@@ -437,12 +547,14 @@ mod tests {
                             if chunk.is_none() {
                                 let event = if fail_flush {
                                     StreamingEvent::Error(crate::error::TranscribeError::InferenceFailed("flush failed".into()))
-                                } else { StreamingEvent::Final {text:"hello world".into(), segment_id:0} };
+                                } else { StreamingEvent::Final {text: if count_results { format!("samples:{count}") } else { "hello world".into() }, segment_id:0} };
                                 let _ = tx.send(event).await;
                                 let _ = tx.send(StreamingEvent::Ended).await;
                                 break;
                             }
-                            received.fetch_add(chunk.unwrap().len(), Ordering::SeqCst);
+                            let size = chunk.unwrap().len();
+                            count += size;
+                            received.fetch_add(size, Ordering::SeqCst);
                             tokio::time::sleep(delay).await;
                             let _ = tx.send(StreamingEvent::Partial {text:"hello".into(), segment_id:0}).await;
                         }
@@ -575,6 +687,56 @@ mod tests {
             Ok("hello".into())
         }
     }
+    #[tokio::test]
+    async fn batch_shutdown_joins_running_preview_without_starting_final() {
+        struct BlockingBatch {
+            started: std::sync::Mutex<Option<oneshot::Sender<()>>>,
+            release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
+            calls: AtomicUsize,
+        }
+        impl Transcriber for BlockingBatch {
+            fn transcribe(&self, _: &[f32]) -> Result<String, crate::error::TranscribeError> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                self.started
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap()
+                    .send(())
+                    .unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Ok("hello".into())
+            }
+        }
+        let (started, running) = oneshot::channel();
+        let (release, gate) = std::sync::mpsc::channel();
+        let model = Arc::new(BlockingBatch {
+            started: std::sync::Mutex::new(Some(started)),
+            release: std::sync::Mutex::new(gate),
+            calls: AtomicUsize::new(0),
+        });
+        let (session, admission) = start(model.clone(), None, 5);
+        let mut sessions = Sessions::new(false);
+        sessions.insert(session);
+        admission
+            .audio
+            .send(Input::Audio(vec![0.1; 32000]))
+            .await
+            .unwrap();
+        running.await.unwrap();
+        let shutdown = sessions.shutdown();
+        tokio::pin!(shutdown);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut shutdown)
+                .await
+                .is_err()
+        );
+        release.send(()).unwrap();
+        shutdown.await;
+        assert_eq!(model.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&model), 1);
+        drop(admission); // Keep the consumer alive: shutdown must explicitly cancel.
+    }
     type TestSocket = tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
     >;
@@ -617,34 +779,38 @@ mod tests {
         .unwrap();
     }
     async fn resumable_server() -> (String, Arc<StreamFake>, tokio::task::JoinHandle<()>) {
+        resumable_server_with_model(Arc::new(StreamFake::new(false))).await
+    }
+    async fn resumable_server_with_model(
+        model: Arc<StreamFake>,
+    ) -> (String, Arc<StreamFake>, tokio::task::JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("ws://{}/v1/dictate", listener.local_addr().unwrap());
         let mut requests = serve(listener, "resume-test".into());
-        let model = Arc::new(StreamFake::new(false));
         let shared = model.clone();
         let supervisor = tokio::spawn(async move {
-            let mut active: Option<Session> = None;
+            let mut active = Sessions::new(true);
             loop {
                 tokio::select! {
                     request = requests.recv() => {
                         let Some(request) = request else { break; };
-                        if active.is_some() { let _ = request.reply.send(Err("busy")); }
+                        if !active.can_admit(DesktopActivity::Idle) { let _ = request.reply.send(Err("busy")); }
                         else {
                             let (session, admission) = start(shared.clone(), None, 60);
-                            active = Some(session);
+                            active.insert(session);
                             let _ = request.reply.send(Ok(admission));
                         }
                     }
-                    result = async { (&mut active.as_mut().unwrap().task).await }, if active.is_some() => {
-                        let session = active.take().unwrap();
+                    (events, result) = active.next_completed(), if !active.is_empty() => {
                         let event = match result {
                             Ok(Ok(Some(text))) => json!({"type":"final","text":text}),
                             _ => json!({"type":"error","code":"transcription_failed"}),
                         };
-                        let _ = session.events.send(event).await;
+                        let _ = events.send(event).await;
                     }
                 }
             }
+            active.shutdown().await;
         });
         (url, model, supervisor)
     }
@@ -655,6 +821,149 @@ mod tests {
                 return event;
             }
         }
+    }
+
+    #[tokio::test]
+    async fn concurrent_phones_keep_audio_and_results_separate_and_reject_third() {
+        let mut fake = StreamFake::new(false);
+        fake.count_results = true;
+        let (url, model, supervisor) = resumable_server_with_model(Arc::new(fake)).await;
+        let mut first = resume_socket(&url, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa").await;
+        assert_eq!(next_event(&mut first).await["type"], "ready");
+        let mut second = resume_socket(&url, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb").await;
+        assert_eq!(next_event(&mut second).await["type"], "ready");
+        let mut third = resume_socket(&url, "cccccccccccccccccccccccccccccccc").await;
+        assert_eq!(next_event(&mut third).await["code"], "busy");
+        send_frame(&mut first, 0, 5, true, 1600).await;
+        send_frame(&mut second, 0, 5, false, 0).await;
+        send_frame(&mut second, 1, 5, true, 3200).await;
+        first
+            .send(Message::Text(r#"{"type":"finish"}"#.into()))
+            .await
+            .unwrap();
+        second
+            .send(Message::Text(r#"{"type":"finish"}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(final_event(&mut first).await["text"], "samples:1600");
+        assert_eq!(final_event(&mut second).await["text"], "samples:3200");
+        assert_eq!(model.active.load(Ordering::SeqCst), 0);
+        assert_eq!(model.starts.load(Ordering::SeqCst), 2);
+        supervisor.abort();
+    }
+
+    #[tokio::test]
+    async fn new_phone_cannot_abandon_another_disconnected_session() {
+        let (url, model, supervisor) = resumable_server().await;
+        let id = "dddddddddddddddddddddddddddddddd";
+        let mut first = resume_socket(&url, id).await;
+        next_event(&mut first).await;
+        send_frame(&mut first, 0, 5, false, 0).await;
+        next_event(&mut first).await;
+        drop(first);
+        let mut second = resume_socket(&url, "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee").await;
+        assert_eq!(next_event(&mut second).await["type"], "ready");
+        let mut resumed = resume_socket(&url, id).await;
+        assert_eq!(next_event(&mut resumed).await["accepted_frames"], 1);
+        second
+            .send(Message::Text(r#"{"type":"cancel"}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(final_event(&mut second).await["code"], "cancelled");
+        send_frame(&mut resumed, 1, 5, true, 3200).await;
+        resumed
+            .send(Message::Text(r#"{"type":"finish"}"#.into()))
+            .await
+            .unwrap();
+        assert_eq!(final_event(&mut resumed).await["text"], "hello world");
+        // The cancelled sibling can still be finishing its worker join.
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while model.active.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(model.cancelled.load(Ordering::SeqCst), 1);
+        supervisor.abort();
+    }
+
+    fn pending_session() -> (Session, oneshot::Sender<()>, oneshot::Receiver<()>) {
+        let (events, _) = mpsc::channel(1);
+        let (cancel, cancelled) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let _ = released.await;
+            Ok(None)
+        });
+        (
+            Session {
+                events,
+                task,
+                cancel,
+            },
+            release,
+            cancelled,
+        )
+    }
+
+    #[tokio::test]
+    async fn shared_admission_counts_desktop_and_keeps_cancelled_slot_until_join() {
+        let mut shared = Sessions::new(true);
+        assert!(shared.can_admit(DesktopActivity::Streaming));
+        let (first, release_first, _) = pending_session();
+        shared.insert(first);
+        assert!(!shared.can_admit(DesktopActivity::Streaming));
+        assert!(shared.can_start_desktop());
+        assert!(!shared.can_admit(DesktopActivity::Exclusive));
+        let (second, release_second, cancelled) = pending_session();
+        shared.insert(second);
+        let (replacement, _) = oneshot::channel();
+        let cancel = std::mem::replace(&mut shared.active[1].cancel, replacement);
+        let _ = cancel.send(());
+        cancelled.await.unwrap();
+        assert!(!shared.can_admit(DesktopActivity::Idle));
+        assert!(!shared.can_start_desktop());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), shared.next_completed())
+                .await
+                .is_err()
+        );
+        release_second.send(()).unwrap();
+        // The slow first stream must not hold back completion of the second.
+        let (_, result) = tokio::time::timeout(Duration::from_secs(1), shared.next_completed())
+            .await
+            .unwrap();
+        assert!(result.unwrap().unwrap().is_none());
+        assert!(shared.can_start_desktop());
+        release_first.send(()).unwrap();
+        let _ = shared.next_completed().await;
+        assert!(shared.is_empty());
+
+        let mut exclusive = Sessions::new(false);
+        assert!(!exclusive.can_admit(DesktopActivity::Streaming));
+        let (session, release, _) = pending_session();
+        exclusive.insert(session);
+        assert!(!exclusive.can_admit(DesktopActivity::Idle));
+        assert!(!exclusive.can_start_desktop());
+        release.send(()).unwrap();
+        let _ = exclusive.next_completed().await;
+    }
+
+    #[tokio::test]
+    async fn shared_shutdown_cancels_both_and_joins_workers() {
+        let model = Arc::new(StreamFake::new(false));
+        let mut sessions = Sessions::new(true);
+        let (first, a) = start(model.clone(), None, 5);
+        let (second, b) = start(model.clone(), None, 5);
+        sessions.insert(first);
+        sessions.insert(second);
+        tokio::task::yield_now().await;
+        sessions.shutdown().await;
+        assert!(sessions.is_empty());
+        assert_eq!(model.active.load(Ordering::SeqCst), 0);
+        assert_eq!(model.cancelled.load(Ordering::SeqCst), 2);
+        drop((a, b));
     }
     #[tokio::test]
     async fn resume_after_disconnect_continues_same_worker_without_replaying_audio() {

@@ -25,6 +25,7 @@ enum CaptureCommand {
 struct StreamBuildParams {
     samples: Arc<Mutex<Vec<f32>>>,
     tx: mpsc::Sender<Vec<f32>>,
+    chunk_overflowed: Arc<AtomicBool>,
     source_channels: usize,
     /// Shared with the capture thread so the tail can be flushed on stop.
     /// The resampler lags its input by a chunk, so without this the last
@@ -40,6 +41,8 @@ pub struct CpalCapture {
     cmd_tx: Option<std::sync::mpsc::Sender<CaptureCommand>>,
     /// Handle to the capture thread
     thread_handle: Option<thread::JoinHandle<()>>,
+    chunk_overflowed: Arc<AtomicBool>,
+    stream_dead: Arc<AtomicBool>,
 }
 
 impl CpalCapture {
@@ -49,6 +52,8 @@ impl CpalCapture {
             config: config.clone(),
             cmd_tx: None,
             thread_handle: None,
+            chunk_overflowed: Arc::new(AtomicBool::new(false)),
+            stream_dead: Arc::new(AtomicBool::new(false)),
         })
     }
 }
@@ -191,6 +196,10 @@ impl AudioCapture for CpalCapture {
         // Shared state
         let samples = Arc::new(Mutex::new(Vec::<f32>::new()));
         let samples_clone = samples.clone();
+        self.chunk_overflowed.store(false, Ordering::SeqCst);
+        self.stream_dead.store(false, Ordering::SeqCst);
+        let chunk_overflowed = self.chunk_overflowed.clone();
+        let stream_dead = self.stream_dead.clone();
 
         // Spawn audio capture thread
         let thread_handle = thread::spawn(move || {
@@ -206,9 +215,7 @@ impl AudioCapture for CpalCapture {
             // until the daemon restarted, which is what a USB or Bluetooth
             // microphone disconnect looks like in practice (#642).
             //
-            // The flag is read by `is_stream_dead` so `start()` can rebuild
-            // rather than hand back a stream that will never produce a sample.
-            let stream_dead = Arc::new(AtomicBool::new(false));
+            // Streaming observes this flag and rejects an incomplete transcript.
             let stream_dead_for_cb = stream_dead.clone();
             let device_label = device_name.clone();
             let err_fn = move |err| {
@@ -239,6 +246,7 @@ impl AudioCapture for CpalCapture {
             let make_params = || StreamBuildParams {
                 samples: samples_clone.clone(),
                 tx: chunk_tx.clone(),
+                chunk_overflowed: chunk_overflowed.clone(),
                 source_channels,
                 resampler: resampler.clone(),
             };
@@ -305,6 +313,7 @@ impl AudioCapture for CpalCapture {
                                     if let Ok(mut s) = samples_clone.lock() {
                                         s.extend_from_slice(&tail);
                                     }
+                                    send_streaming_chunk(&chunk_tx, tail, &chunk_overflowed);
                                 }
                             }
                         }
@@ -405,6 +414,28 @@ impl AudioCapture for CpalCapture {
         }
         Vec::new()
     }
+
+    fn streaming_error(&self) -> Option<AudioError> {
+        if self.chunk_overflowed.load(Ordering::SeqCst) {
+            Some(AudioError::StreamError(
+                "streaming audio queue overflowed; record again".into(),
+            ))
+        } else if self.stream_dead.load(Ordering::SeqCst) {
+            Some(AudioError::StreamError(
+                "audio device failed during streaming".into(),
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+// A real-time capture callback cannot wait for inference. Keep its queue bounded
+// and expose overflow to the desktop session rather than silently losing audio.
+fn send_streaming_chunk(tx: &mpsc::Sender<Vec<f32>>, chunk: Vec<f32>, overflowed: &AtomicBool) {
+    if matches!(tx.try_send(chunk), Err(mpsc::error::TrySendError::Full(_))) {
+        overflowed.store(true, Ordering::SeqCst);
+    }
 }
 
 /// Build an input stream for a specific sample type
@@ -423,6 +454,7 @@ where
     let StreamBuildParams {
         samples,
         tx,
+        chunk_overflowed,
         source_channels,
         resampler,
         ..
@@ -461,8 +493,7 @@ where
                     guard.extend_from_slice(&resampled);
                 }
 
-                // Send chunk for streaming (ignore errors - receiver might be gone)
-                let _ = tx.try_send(resampled);
+                send_streaming_chunk(&tx, resampled, &chunk_overflowed);
             },
             err_fn,
             None,
@@ -475,6 +506,32 @@ where
 #[cfg(test)]
 mod tests {
     use super::super::resampler::resample_buffer;
+    use super::*;
+
+    #[tokio::test]
+    async fn streaming_callback_overflow_is_reported_but_closed_receiver_is_not() {
+        let capture = CpalCapture::new(&AudioConfig::default()).unwrap();
+        let (tx, mut rx) = mpsc::channel(1);
+        send_streaming_chunk(&tx, vec![1.0], &capture.chunk_overflowed);
+        assert!(capture.streaming_error().is_none());
+        send_streaming_chunk(&tx, vec![2.0], &capture.chunk_overflowed);
+        assert!(capture
+            .streaming_error()
+            .unwrap()
+            .to_string()
+            .contains("overflowed"));
+        assert_eq!(rx.recv().await.unwrap(), vec![1.0]);
+        capture.chunk_overflowed.store(false, Ordering::SeqCst);
+        drop(rx);
+        send_streaming_chunk(&tx, vec![3.0], &capture.chunk_overflowed);
+        assert!(capture.streaming_error().is_none());
+        capture.stream_dead.store(true, Ordering::SeqCst);
+        assert!(capture
+            .streaming_error()
+            .unwrap()
+            .to_string()
+            .contains("device failed"));
+    }
 
     // These moved off the removed linear-interpolation `resample()` and onto
     // the band-limited path (#641). They cover very short inputs, which is a

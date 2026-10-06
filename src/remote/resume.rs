@@ -45,8 +45,6 @@ enum Command {
     Finish(u64),
     Detach(u64),
     Cancel(u64),
-    // A new dictation can discard an unfinished, disconnected predecessor.
-    Abandon,
     Ack(u64),
     Evict,
 }
@@ -69,12 +67,6 @@ impl Registry {
         entries.retain(|_, e| !e.commands.is_closed());
         if let Some(entry) = entries.get(id) {
             return Ok(entry.clone());
-        }
-        for entry in entries.values() {
-            let state = entry.state.borrow();
-            if !state.attached && !state.finished && !state.terminal {
-                let _ = entry.commands.try_send(Command::Abandon);
-            }
         }
         if entries.len() >= CACHE_SIZE {
             let old = entries
@@ -286,9 +278,6 @@ fn spawn(admission: Admission, ready: Value, mut decoder: opus::Decoder) -> Arc<
                         Command::Cancel(epoch) if epoch == snapshot.epoch => {
                             snapshot.event(json!({"type":"error","code":"cancelled"}));
                             terminal_expiry = Some(Instant::now());
-                        }
-                        Command::Abandon if !snapshot.attached && !snapshot.finished && !snapshot.terminal => {
-                            snapshot.event(json!({"type":"error","code":"cancelled"}));
                         }
                         Command::Ack(epoch) if epoch == snapshot.epoch && snapshot.terminal => break,
                         Command::Evict => break,

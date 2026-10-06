@@ -810,6 +810,7 @@ pub struct Daemon {
     /// streaming session is draining server-side after the mic stopped.
     /// Aborted in `end_streaming`.
     streaming_drain_pump: Option<tokio::task::JoinHandle<()>>,
+    streaming_capture_error: Option<crate::error::TranscribeError>,
     /// OSD child supervisor task. Holds the JoinHandle so dropping it (on
     /// daemon shutdown) kill_on_drop's the spawned voxtype-osd process.
     osd_supervisor_task: Option<tokio::task::JoinHandle<()>>,
@@ -951,6 +952,7 @@ impl Daemon {
             level_hub: None,
             level_emitter_task: None,
             streaming_drain_pump: None,
+            streaming_capture_error: None,
             osd_supervisor_task: None,
             model_manager: None,
             model_load_task: None,
@@ -1163,6 +1165,7 @@ impl Daemon {
             return false;
         }
 
+        self.streaming_capture_error = None;
         let (capture, samples_rx) = match self.start_streaming_capture().await {
             Ok(v) => v,
             Err(()) => return false,
@@ -1258,7 +1261,7 @@ impl Daemon {
         }
     }
 
-    /// Early-stop the streaming capture: cut audio flow to the backend,
+    /// Early-stop the streaming capture: Unified drains already captured audio,
     /// start the OSD silence pump so the visualizer stays alive during
     /// drain, and stop the mic. Unified must keep its output destination until
     /// the final transcript arrives; incremental backends retain their existing
@@ -1270,10 +1273,20 @@ impl Daemon {
         streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
         discard_incremental_tail: bool,
     ) {
-        self.cut_streaming_audio();
+        let unified = self.config.engine == crate::config::TranscriptionEngine::Parakeet;
+        if !unified {
+            self.cut_streaming_audio();
+        }
         self.start_streaming_drain_pump();
         if let Some(mut c) = audio_capture.take() {
-            let _ = c.stop().await;
+            let stopped = c.stop().await;
+            if unified {
+                if let Some(error) = stopped.err().or_else(|| c.streaming_error()) {
+                    self.streaming_capture_error = Some(
+                        crate::error::TranscribeError::AudioFormat(error.to_string()),
+                    );
+                }
+            }
         }
         self.restore_recording_media();
         if self.config.engine == crate::config::TranscriptionEngine::Parakeet {
@@ -1297,12 +1310,26 @@ impl Daemon {
         streaming_chain: &mut Option<Vec<Box<dyn TextOutput>>>,
         result: TranscriptionResult,
     ) {
-        self.cut_streaming_audio();
         if let Some(mut capture) = audio_capture.take() {
-            let _ = capture.stop().await;
+            let stopped = capture.stop().await;
+            if let Some(error) = stopped.err().or_else(|| capture.streaming_error()) {
+                self.streaming_capture_error = Some(crate::error::TranscribeError::AudioFormat(
+                    error.to_string(),
+                ));
+            }
         }
         self.restore_recording_media();
+        let result = self.streaming_capture_error.take().map_or(result, Err);
+        if result.is_err() {
+            self.cut_streaming_audio();
+        } else if let Some(tap) = self.level_emitter_task.take() {
+            let _ = tap.await;
+        }
         let result = if let Some(handle) = streaming_handle.take() {
+            if result.is_err() {
+                let _ = handle.cancel.send(());
+                drop(handle.events);
+            }
             match handle.task.await {
                 Ok(Ok(())) => Ok(result),
                 Ok(Err(error)) => Ok(Err(error)),
@@ -1377,6 +1404,7 @@ impl Daemon {
         if let Some(task) = backend_task {
             let _ = task.await;
         }
+        self.streaming_capture_error = None;
         if let Some(s) = streaming_session.as_mut() {
             if let Err(e) = s.rewind().await {
                 tracing::warn!("Streaming rewind failed: {}", e);
@@ -1430,8 +1458,8 @@ impl Daemon {
         match audio::create_capture(&self.config.audio) {
             Ok(mut capture) => match capture.start().await {
                 Ok(chunk_rx) => {
-                    // Bounded; backed-up streaming backend drops chunks
-                    // rather than back-pressuring the capture.
+                    // Bounded backpressure. The capture reports an error if
+                    // its real-time callback queue overflows.
                     let (streaming_tx, streaming_rx) = tokio::sync::mpsc::channel::<Vec<f32>>(64);
 
                     if let Some(handle) = self.level_emitter_task.take() {
@@ -1448,8 +1476,8 @@ impl Daemon {
                         tokio::spawn(async move {
                             let mut rx = chunk_rx;
                             while let Some(chunk) = rx.recv().await {
-                                if streaming_tx.try_send(chunk).is_err() {
-                                    // Backend slow or gone; drop and keep going.
+                                if streaming_tx.send(chunk).await.is_err() {
+                                    break;
                                 }
                             }
                         })
@@ -1976,6 +2004,18 @@ impl Daemon {
                 tracing::warn!("{}", e);
             }
         }
+    }
+
+    fn reject_busy_desktop_start(&self) {
+        tracing::warn!("Dictation busy: no model admission slot available");
+        self.publish_empty_outcome();
+        cleanup_output_mode_override();
+        cleanup_model_override();
+        cleanup_profile_override();
+        cleanup_bool_override("auto_submit");
+        cleanup_bool_override("shift_enter");
+        cleanup_bool_override("smart_auto_submit");
+        self.play_feedback(SoundEvent::Error);
     }
 
     /// Spawn a transcription task for a single chunk (eager processing)
@@ -3027,7 +3067,11 @@ impl Daemon {
             return Err(crate::error::VoxtypeError::Config(
                 "Mobile API requires a preloaded batch or Parakeet Unified streaming model, no Whisper CLI mode, GPU isolation, secondary model, eager processing or meeting mode".into()));
         }
-        let mut remote: Option<crate::remote::Session> = None;
+        let shared_streaming = self.config.engine == crate::config::TranscriptionEngine::Parakeet
+            && transcriber_preloaded
+                .as_ref()
+                .is_some_and(|t| t.as_streaming().is_some());
+        let mut remote = crate::remote::Sessions::new(shared_streaming);
 
         // Streaming session locals (Some only while State::Streaming).
         let mut streaming_handle: Option<StreamHandle> = None;
@@ -3043,7 +3087,16 @@ impl Daemon {
                     }
                 } => {
                     if request.reply.is_closed() { continue; }
-                    if remote.is_some() || !state.is_idle() || streaming_handle.is_some() || self.transcription_task.is_some() || self.meeting_active() {
+                    let desktop = if self.transcription_task.is_some() || self.meeting_active() {
+                        crate::remote::DesktopActivity::Exclusive
+                    } else if state.is_streaming() && streaming_handle.is_some() {
+                        crate::remote::DesktopActivity::Streaming
+                    } else if state.is_idle() && streaming_handle.is_none() {
+                        crate::remote::DesktopActivity::Idle
+                    } else {
+                        crate::remote::DesktopActivity::Exclusive
+                    };
+                    if !remote.can_admit(desktop) {
                         let _ = request.reply.send(Err("busy"));
                         continue;
                     }
@@ -3051,19 +3104,13 @@ impl Daemon {
                         Ok(model) => {
                             let (session, admission) = crate::remote::start(model, self.vad.clone(),
                                 self.config.audio.max_duration_secs.clamp(1, 300));
-                            remote = Some(session);
+                            remote.insert(session);
                             let _ = request.reply.send(Ok(admission));
                         }
                         Err(()) => { let _ = request.reply.send(Err("model_unavailable")); }
                     }
                 }
-                result = async {
-                    match remote.as_mut() {
-                        Some(session) => (&mut session.task).await,
-                        None => std::future::pending().await,
-                    }
-                }, if remote.is_some() => {
-                    let session = remote.take().unwrap();
+                (events, result) = remote.next_completed(), if !remote.is_empty() => {
                     let event = match result {
                         Ok(Ok(Some(text))) => {
                             let text = self.text_processor.process(&text);
@@ -3084,7 +3131,7 @@ impl Daemon {
                             serde_json::json!({"type":"error","code":"transcription_failed"})
                         }
                     };
-                    let _ = tokio::time::timeout(Duration::from_secs(2), session.events.send(event)).await;
+                    let _ = tokio::time::timeout(Duration::from_secs(2), events.send(event)).await;
                 }
                 // Handle hotkey events (only if hotkey listener is enabled)
                 Some(hotkey_event) = async {
@@ -3093,7 +3140,10 @@ impl Daemon {
                         None => std::future::pending().await,
                     }
                 } => {
-                    if remote.is_some() { continue; }
+                    if state.is_idle() && matches!(hotkey_event, HotkeyEvent::Pressed { .. }) && !remote.can_start_desktop() {
+                        self.reject_busy_desktop_start();
+                        continue;
+                    }
                     match (hotkey_event, activation_mode) {
                         // === PUSH-TO-TALK MODE ===
                         (HotkeyEvent::Pressed { model_override, profile_override }, ActivationMode::PushToTalk) => {
@@ -3189,6 +3239,10 @@ impl Daemon {
                                     model_override.clone(),
                                 ).await {
                                     tracing::info!("Streaming session started (push-to-talk)");
+                                } else if !remote.is_empty() {
+                                    self.cut_streaming_audio();
+                                    self.publish_empty_outcome();
+                                    self.reset_to_idle(&mut state).await;
                                 } else {
                                     // Create and start audio capture
                                     tracing::debug!("Creating audio capture with device: {}", self.config.audio.device);
@@ -3391,6 +3445,10 @@ impl Daemon {
                                     model_override.clone(),
                                 ).await {
                                     tracing::info!("Streaming session started (toggle)");
+                                } else if !remote.is_empty() {
+                                    self.cut_streaming_audio();
+                                    self.publish_empty_outcome();
+                                    self.reset_to_idle(&mut state).await;
                                 } else {
                                     match self.start_recording_capture().await {
                                         Ok(capture) => {
@@ -3651,6 +3709,20 @@ impl Daemon {
                         continue;
                     }
 
+                    if state.is_streaming() && self.config.engine == crate::config::TranscriptionEngine::Parakeet {
+                        if let Some(error) = audio_capture.as_ref().and_then(|capture| capture.streaming_error()) {
+                            tracing::error!(%error, "Desktop streaming capture failed");
+                            self.streaming_capture_error = Some(crate::error::TranscribeError::AudioFormat(error.to_string()));
+                            self.stop_streaming_capture(&mut audio_capture, &mut streaming_session, &mut streaming_chain, false).await;
+                        }
+                        if self.streaming_capture_error.is_some() {
+                            self.complete_unified_desktop(&mut state, &mut audio_capture, &mut streaming_handle,
+                                &mut streaming_session, &mut streaming_chain,
+                                Err(crate::error::TranscribeError::AudioFormat("incomplete capture".into()))).await;
+                            continue;
+                        }
+                    }
+
                     // Populate eager transcriber cache on first poll
                     if eager_transcriber.is_none() && state.is_eager_recording() {
                         let model_override = match &state {
@@ -3794,7 +3866,10 @@ impl Daemon {
 
                 // Handle SIGUSR1 - start recording (for compositor keybindings)
                 _ = sigusr1.recv() => {
-                    if remote.is_some() { continue; }
+                    if state.is_idle() && !remote.can_start_desktop() {
+                        self.reject_busy_desktop_start();
+                        continue;
+                    }
                     tracing::debug!("Received SIGUSR1 (start recording)");
                     if state.is_idle() {
                         // Read model override from file (set by `voxtype record start --model X`)
@@ -3877,6 +3952,10 @@ impl Daemon {
                             model_override.clone(),
                         ).await {
                             tracing::info!("Streaming session started (SIGUSR1)");
+                        } else if !remote.is_empty() {
+                            self.cut_streaming_audio();
+                            self.publish_empty_outcome();
+                            self.reset_to_idle(&mut state).await;
                         } else {
                             match self.start_recording_capture().await {
                                 Ok(capture) => {
@@ -3920,7 +3999,6 @@ impl Daemon {
 
                 // Handle SIGUSR2 - stop recording (for compositor keybindings)
                 _ = sigusr2.recv() => {
-                    if remote.is_some() { continue; }
                     tracing::debug!("Received SIGUSR2 (stop recording)");
                     if state.is_streaming() {
                         tracing::info!("SIGUSR2 stop while streaming; finishing capture");
@@ -4175,7 +4253,7 @@ impl Daemon {
                         std::sync::atomic::AtomicU32::new(0);
                     let count =
                         EVICTION_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if count.is_multiple_of(600) && remote.is_none() && matches!(state, State::Idle) {
+                    if count.is_multiple_of(600) && remote.is_empty() && matches!(state, State::Idle) {
                         if let Some(ref mut mm) = self.model_manager {
                             mm.evict_idle_models();
                         }
@@ -4183,7 +4261,7 @@ impl Daemon {
 
                     // Check for meeting start command
                     if let Some(trigger) = check_meeting_start() {
-                        if remote.is_none() && self.config.meeting.enabled && self.meeting_daemon.is_none() {
+                        if remote.is_empty() && self.config.meeting.enabled && self.meeting_daemon.is_none() {
                             tracing::debug!("Meeting start requested via file trigger");
                             if let Err(e) = self.start_meeting(trigger.title, trigger.diarization).await {
                                 tracing::error!("Failed to start meeting: {}", e);
@@ -4343,6 +4421,7 @@ impl Daemon {
         if let Some(task) = streaming_task {
             let _ = task.await;
         }
+        remote.shutdown().await;
 
         // Cleanup hotkey listener
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -4475,6 +4554,220 @@ mod tests {
                 typed_chars: 0,
             },
         )
+    }
+
+    struct SharedDesktopModel {
+        starts: std::sync::atomic::AtomicUsize,
+        active: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Transcriber for SharedDesktopModel {
+        fn transcribe(&self, _: &[f32]) -> TranscriptionResult {
+            panic!("must use the shared streaming handle")
+        }
+        fn as_streaming(&self) -> Option<&dyn crate::transcribe::streaming::StreamingTranscriber> {
+            Some(self)
+        }
+    }
+
+    impl crate::transcribe::streaming::StreamingTranscriber for SharedDesktopModel {
+        fn start_stream(
+            &self,
+            mut samples: tokio::sync::mpsc::Receiver<Vec<f32>>,
+        ) -> std::result::Result<StreamHandle, crate::error::TranscribeError> {
+            use std::sync::atomic::Ordering;
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            assert!(self.active.fetch_add(1, Ordering::SeqCst) < 2);
+            let active = self.active.clone();
+            let (tx, events) = tokio::sync::mpsc::channel(4);
+            let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let mut count = 0;
+                loop {
+                    tokio::select! {
+                        biased;
+                        _ = &mut cancelled => break,
+                        chunk = samples.recv() => match chunk {
+                            Some(chunk) => count += chunk.len(),
+                            None => {
+                                let _ = tx.send(StreamingEvent::Final { text: format!("samples:{count}"), segment_id: 0 }).await;
+                                let _ = tx.send(StreamingEvent::Ended).await;
+                                break;
+                            }
+                        }
+                    }
+                }
+                active.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            });
+            Ok(StreamHandle {
+                events,
+                cancel,
+                task,
+            })
+        }
+    }
+
+    struct StreamingCaptureFake {
+        chunks: Option<tokio::sync::mpsc::Sender<Vec<f32>>>,
+        failed: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl AudioCapture for StreamingCaptureFake {
+        async fn start(
+            &mut self,
+        ) -> std::result::Result<tokio::sync::mpsc::Receiver<Vec<f32>>, crate::error::AudioError>
+        {
+            unreachable!()
+        }
+        async fn stop(&mut self) -> std::result::Result<Vec<f32>, crate::error::AudioError> {
+            if let Some(tx) = self.chunks.take() {
+                let _ = tx.send(vec![0.1; 320]).await;
+            }
+            Ok(Vec::new())
+        }
+        async fn get_samples(&mut self) -> Vec<f32> {
+            Vec::new()
+        }
+        fn streaming_error(&self) -> Option<crate::error::AudioError> {
+            self.failed
+                .then(|| crate::error::AudioError::StreamError("capture overflow".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn unified_desktop_and_phone_share_model_with_independent_stop_cancel_and_output() {
+        if isolated_desktop_test(
+            "unified_desktop_and_phone_share_model_with_independent_stop_cancel_and_output",
+        ) {
+            return;
+        }
+        use crate::transcribe::streaming::StreamingTranscriber;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Successful pair, local cancel, phone cancel, and incomplete local capture.
+        for scenario in 0..4 {
+            let dir = TempDir::new().unwrap();
+            let (mut daemon, mut state) = unified_desktop_fixture(dir.path());
+            let model = Arc::new(SharedDesktopModel {
+                starts: AtomicUsize::new(0),
+                active: Arc::new(AtomicUsize::new(0)),
+            });
+            let (source_tx, mut source_rx) = tokio::sync::mpsc::channel(4);
+            let (stream_tx, stream_rx) = tokio::sync::mpsc::channel(1);
+            daemon.level_emitter_task = Some(tokio::spawn(async move {
+                while let Some(chunk) = source_rx.recv().await {
+                    if stream_tx.send(chunk).await.is_err() {
+                        break;
+                    }
+                }
+            }));
+            let mut handle = Some(model.start_stream(stream_rx).unwrap());
+            let mut capture: Option<Box<dyn AudioCapture>> = Some(Box::new(StreamingCaptureFake {
+                chunks: Some(source_tx.clone()),
+                failed: scenario == 3,
+            }));
+            source_tx.send(vec![0.1; 1600]).await.unwrap();
+            // A failed capture thread might retain its sender after Stop fails.
+            // Error teardown must cancel/join instead of waiting forever for EOF.
+            let _stuck_source = if scenario == 3 {
+                Some(source_tx)
+            } else {
+                drop(source_tx);
+                None
+            };
+            let mut session = Some(StreamingSession::new());
+            let mut chain = Some(Vec::new());
+            let (phone, mut admission) = crate::remote::start(model.clone(), None, 5);
+            assert_eq!(admission.events.recv().await.unwrap()["type"], "ready");
+            admission
+                .audio
+                .send(crate::remote::Input::Audio(vec![0.2; 3200]))
+                .await
+                .unwrap();
+            if scenario == 1 {
+                daemon
+                    .cancel_streaming_to_idle(
+                        &mut state,
+                        &mut capture,
+                        &mut handle,
+                        &mut session,
+                        &mut chain,
+                        "test",
+                    )
+                    .await;
+            } else {
+                daemon
+                    .stop_streaming_capture(&mut capture, &mut session, &mut chain, false)
+                    .await;
+            }
+            if scenario == 2 {
+                drop(admission);
+            } else {
+                admission
+                    .audio
+                    .send(crate::remote::Input::Finish)
+                    .await
+                    .unwrap();
+            }
+            let phone_result = phone.task.await.unwrap().unwrap();
+            assert_eq!(
+                phone_result.as_deref(),
+                if scenario == 2 {
+                    None
+                } else {
+                    Some("samples:3200")
+                }
+            );
+            // Phone recognition has no desktop output, even with local capture stopped.
+            assert!(!dir.path().join("transcript.txt").exists());
+            if scenario == 3 {
+                tokio::time::timeout(
+                    Duration::from_secs(1),
+                    daemon.complete_unified_desktop(
+                        &mut state,
+                        &mut capture,
+                        &mut handle,
+                        &mut session,
+                        &mut chain,
+                        Err(crate::error::TranscribeError::AudioFormat(
+                            "capture failed".into(),
+                        )),
+                    ),
+                )
+                .await
+                .unwrap();
+            } else if scenario != 1 {
+                let event = handle.as_mut().unwrap().events.recv().await.unwrap();
+                let StreamingEvent::Final { text, .. } = event else {
+                    panic!("expected local final")
+                };
+                assert_eq!(
+                    text, "samples:1920",
+                    "Stop must preserve queued samples and the capture tail"
+                );
+                daemon
+                    .complete_unified_desktop(
+                        &mut state,
+                        &mut capture,
+                        &mut handle,
+                        &mut session,
+                        &mut chain,
+                        Ok(text),
+                    )
+                    .await;
+            }
+            let output = dir.path().join("transcript.txt");
+            if scenario == 0 || scenario == 2 {
+                assert_eq!(fs::read_to_string(output).unwrap().trim(), "samples:1920");
+            } else {
+                assert!(!output.exists());
+            }
+            assert!(state.is_idle() && handle.is_none());
+            assert_eq!(model.starts.load(Ordering::SeqCst), 2);
+            assert_eq!(model.active.load(Ordering::SeqCst), 0);
+            assert_eq!(Arc::strong_count(&model), 1);
+        }
     }
 
     #[tokio::test]

@@ -121,9 +121,9 @@ Unfinished disconnected sessions wait 30 seconds (2 seconds with no frames).
 Accepted finish permits offline inference within a 480 second overall deadline.
 Terminal results expire after 90 seconds; acknowledgment erases them early,
 and the bounded 8 entry cache may evict terminal results under pressure.
-Explicit cancel or a new ID abandoning a disconnected unfinished predecessor
-closes input, but daemon model admission remains held until in-flight inference
-joins. Network loss may delay cancellation until expiry. No audio or transcript
+Explicit cancel closes that session's input, but its admission slot remains held
+until in-flight inference joins. A new ID cannot abandon another disconnected
+session. Network loss may delay cancellation until expiry. No audio or transcript
 is written to disk. Android process death loses its in-memory recording/result.
 The actor command queue has 8 slots plus one pending socket frame; the duration
 bounded float spool uses 100 ms chunks (at most 19.2 MB) and bounded worker queues.
@@ -135,6 +135,14 @@ Parakeet Unified uses the daemon's existing StreamingTranscriber and shared mode
 handle. Input goes to a bounded audio channel; cumulative partials are forwarded
 and release closes audio so the backend flushes the tail. No batch re-transcription
 occurs. Cancel/error/disconnect joins the worker before releasing admission.
+Unified admits at most two streams total: two phones, or one desktop and one phone.
+Each owns its decoder state, bounded queues, output destination and cancellation;
+the shared model mutex serializes inference. A third stream gets `busy` and may
+retry. Local start/stop/cancel controls affect only desktop. If local streaming
+setup fails while a phone is active, it cannot fall back to exclusive batch
+inference. Shutdown cancels and joins every stream before releasing the model.
+Desktop Stop drains its captured queue and resampler tail; capture queue overflow
+or device failure produces an error instead of inserting a truncated final.
 Full queues apply backpressure instead of rejecting a temporary backlog.
 Both transport and recognition continue consuming result events while waiting
 for audio capacity, avoiding circular waits. Each stage holds at most one pending
@@ -144,9 +152,9 @@ batch VAD pass; the installed configuration has VAD disabled.
 
 The optional batch Parakeet path produces cumulative previews by periodically
 transcribing an audio snapshot through the same Arc used for desktop inference.
-At most one inference runs for this remote session. Release waits for an active
-preview then transcribes all the audio for the final result. This increases CPU
-work and final latency for long recordings; it is not native token streaming.
+Admission is exclusive across desktop and phone sessions. Release waits for an
+active preview then transcribes all the audio for the final result. This increases
+CPU work and final latency for long recordings; it is not native token streaming.
 The configured VAD, text replacement/punctuation processor and post-processing
 command are reused. Desktop context, CLI output overrides, typing, clipboard,
 notifications, hooks and auto-submit are not invoked for phone sessions.

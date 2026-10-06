@@ -557,9 +557,8 @@ pub fn spawn_emitter(
 /// `streaming_tx`, used by the streaming transcription pipeline to feed
 /// audio into a backend without disturbing the OSD level emitter.
 ///
-/// When `streaming_tx` is `Some`, each chunk is cloned and `try_send`'d to
-/// it. Failure to send (closed receiver, full bounded channel) is logged at
-/// trace and never blocks the level emitter. When `streaming_tx` is `None`,
+/// When `streaming_tx` is `Some`, bounded sends preserve every captured chunk
+/// while the backend consumes its result events independently. When it is `None`,
 /// behavior is identical to [`spawn_emitter`].
 pub fn spawn_emitter_with_streaming_tap(
     mut chunk_rx: mpsc::Receiver<Vec<f32>>,
@@ -580,8 +579,8 @@ pub fn spawn_emitter_with_streaming_tap(
             }
 
             if let Some(ref tx) = streaming_tx {
-                if let Err(e) = tx.try_send(chunk) {
-                    tracing::trace!("streaming sample tap try_send failed: {}", e);
+                if tx.send(chunk).await.is_err() {
+                    break;
                 }
             }
         }
@@ -616,6 +615,34 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn streaming_tap_backpressures_and_drains_all_queued_audio_on_stop() {
+        let (broadcast_tx, _) = mpsc::channel(1);
+        let sink = FrameSink {
+            inner: Arc::new(HubInner {
+                state: RwLock::new(Arc::new(HubState {
+                    broadcast_tx,
+                    subscriber_count: Mutex::new(0),
+                })),
+                socket_path: PathBuf::new(),
+            }),
+        };
+        let (capture_tx, capture_rx) = mpsc::channel(4);
+        let (stream_tx, mut stream_rx) = mpsc::channel(1);
+        let tap = spawn_emitter_with_streaming_tap(capture_rx, sink, Some(stream_tx));
+        for sample in 1..=4 {
+            capture_tx.send(vec![sample as f32; 160]).await.unwrap();
+        }
+        drop(capture_tx); // Stop capture while inference is still backed up.
+        tokio::task::yield_now().await;
+        assert!(!tap.is_finished());
+        for sample in 1..=4 {
+            assert_eq!(stream_rx.recv().await.unwrap(), vec![sample as f32; 160]);
+        }
+        assert!(stream_rx.recv().await.is_none());
+        tap.await.unwrap();
+    }
 
     /// Global one-shot panic flag for the accept-loop fault injection
     /// test. We use a global because the panic check is inside
