@@ -193,6 +193,34 @@ impl ModelManager {
     ///
     /// Call this periodically (e.g., every 60 seconds) to free memory
     /// from models that are no longer being actively used.
+    /// Drop every cached model, returning how many were released.
+    ///
+    /// Used after a transcription task panics: the engine may hold state the
+    /// panic left inconsistent, and reusing it risks compounding the fault.
+    /// Unlike `evict_idle_models` this ignores both the idle timeout and the
+    /// is_primary flag, because the point is to discard a suspect instance
+    /// rather than to reclaim memory (#643).
+    pub fn drop_loaded_models(&mut self) -> usize {
+        let count = self.loaded_models.len();
+        self.loaded_models.clear();
+        count
+    }
+
+    /// Discard a poisoned cache only after every external model borrower drains.
+    /// Keeping the old cache until then prevents recovery from loading a second
+    /// engine while an existing worker still holds the first one.
+    pub fn drop_loaded_models_if_unborrowed(&mut self) -> Option<usize> {
+        if self
+            .loaded_models
+            .values()
+            .any(|model| Arc::strong_count(&model.transcriber) > 1)
+        {
+            None
+        } else {
+            Some(self.drop_loaded_models())
+        }
+    }
+
     pub fn evict_idle_models(&mut self) {
         if self.cold_timeout.is_zero() {
             return; // Auto-eviction disabled
@@ -317,6 +345,36 @@ impl ModelManager {
         self.get_transcriber(model)
     }
 
+    /// Register an already-constructed transcriber as a cached model, so
+    /// tests can exercise cache lifecycle paths without a real model file
+    /// on disk.
+    #[cfg(test)]
+    pub(crate) fn insert_loaded_model_for_test(
+        &mut self,
+        name: &str,
+        transcriber: Arc<dyn Transcriber>,
+        is_primary: bool,
+    ) {
+        self.loaded_models.insert(
+            name.to_string(),
+            LoadedModel {
+                transcriber,
+                last_used: Instant::now(),
+                is_primary,
+            },
+        );
+    }
+
+    /// Borrow the resident primary model without loading or preparing one.
+    /// Remote dictation must never turn a missing cache entry into inference
+    /// model construction or a subprocess.
+    pub fn get_loaded_primary_transcriber(&mut self) -> Option<Arc<dyn Transcriber>> {
+        self.loaded_models.get_mut(&self.config.model).map(|model| {
+            model.last_used = Instant::now();
+            Arc::clone(&model.transcriber)
+        })
+    }
+
     /// Get the list of currently loaded models (for debugging/status)
     pub fn loaded_model_names(&self) -> Vec<&str> {
         self.loaded_models
@@ -330,6 +388,54 @@ impl ModelManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Stand-in engine for cache tests: cheap to construct, never touches
+    /// a model file.
+    struct StubTranscriber;
+
+    impl Transcriber for StubTranscriber {
+        fn transcribe(&self, _samples: &[f32]) -> Result<String, TranscribeError> {
+            Ok(String::new())
+        }
+    }
+
+    #[test]
+    fn resident_primary_borrow_never_loads_a_missing_model() {
+        let mut mm = ModelManager::new(&test_config(), None);
+        assert!(mm.get_loaded_primary_transcriber().is_none());
+        assert!(mm.loaded_models.is_empty());
+        mm.insert_loaded_model_for_test("large-v3-turbo", Arc::new(StubTranscriber), false);
+        assert!(mm.get_loaded_primary_transcriber().is_none());
+        let primary: Arc<dyn Transcriber> = Arc::new(StubTranscriber);
+        mm.insert_loaded_model_for_test("base.en", primary.clone(), true);
+        let borrowed = mm.get_loaded_primary_transcriber().unwrap();
+        assert!(Arc::ptr_eq(&primary, &borrowed));
+        assert_eq!(mm.loaded_models.len(), 2);
+        mm.drop_loaded_models();
+        assert!(mm.get_loaded_primary_transcriber().is_none());
+        assert!(mm.loaded_models.is_empty());
+    }
+
+    /// #643: after a panicked transcription the cached engine is suspect, so
+    /// it is dropped wholesale — including the primary, which normal idle
+    /// eviction deliberately keeps.
+    #[test]
+    fn drop_loaded_models_clears_everything_and_reports_the_count() {
+        let mut mm = ModelManager::new(&test_config(), None);
+        assert_eq!(mm.drop_loaded_models(), 0, "nothing cached yet");
+
+        mm.insert_loaded_model_for_test("base.en", Arc::new(StubTranscriber), true);
+        mm.insert_loaded_model_for_test("large-v3-turbo", Arc::new(StubTranscriber), false);
+        assert_eq!(mm.loaded_model_names().len(), 2);
+
+        assert_eq!(
+            mm.drop_loaded_models(),
+            2,
+            "the primary is dropped too, unlike idle eviction"
+        );
+        assert!(mm.loaded_models.is_empty());
+        assert!(mm.loaded_model_names().is_empty());
+    }
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::sync::mpsc::{self, Receiver};

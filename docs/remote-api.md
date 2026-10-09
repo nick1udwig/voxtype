@@ -143,6 +143,8 @@ setup fails while a phone is active, it cannot fall back to exclusive batch
 inference. Shutdown cancels and joins every stream before releasing the model.
 Desktop Stop drains its captured queue and resampler tail; capture queue overflow
 or device failure produces an error instead of inserting a truncated final.
+If desktop task panic recovery invalidates a shared preloaded transcriber, new sessions are rejected until existing workers and model borrowers have drained.
+The daemon releases the old transcriber before creating its replacement; remote admission only borrows a resident model.
 Full queues apply backpressure instead of rejecting a temporary backlog.
 Both transport and recognition continue consuming result events while waiting
 for audio capacity, avoiding circular waits. Each stage holds at most one pending
